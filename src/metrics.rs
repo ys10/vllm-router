@@ -79,6 +79,10 @@ pub fn init_metrics() {
         "vllm_router_policy_decisions_total",
         "Total routing policy decisions by policy and worker"
     );
+    describe_counter!(
+        "vllm_router_agent_rollout_decisions_total",
+        "Agent-aware attempts by rollout percentage, action, and shadow comparison"
+    );
     describe_counter!("vllm_router_cache_hits_total", "Total cache hits");
     describe_counter!("vllm_router_cache_misses_total", "Total cache misses");
     describe_gauge!(
@@ -358,6 +362,20 @@ impl RouterMetrics {
         counter!("vllm_router_policy_decisions_total",
             "policy" => policy.to_string(),
             "worker" => worker.to_string()
+        )
+        .increment(1);
+    }
+
+    pub fn record_agent_rollout_decision(
+        rollout_percent: u8,
+        action: &'static str,
+        shadow_comparison: &'static str,
+    ) {
+        counter!(
+            "vllm_router_agent_rollout_decisions_total",
+            "rollout_percent" => rollout_percent.to_string(),
+            "action" => action,
+            "shadow_comparison" => shadow_comparison
         )
         .increment(1);
     }

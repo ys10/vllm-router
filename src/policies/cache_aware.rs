@@ -64,6 +64,7 @@ use crate::core::Worker;
 use crate::metrics::RouterMetrics;
 use crate::policies::normalize_model_key;
 use crate::tree::Tree;
+use agent_router::{RequestOutcome, RoutingContext};
 use dashmap::DashMap;
 use rand::Rng;
 use std::collections::HashMap;
@@ -375,6 +376,22 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 success
             );
         }
+    }
+
+    fn on_request_start(&self, worker: &Arc<dyn Worker>, _context: &RoutingContext) {
+        worker.increment_load();
+        RouterMetrics::set_running_requests(worker.url(), worker.load());
+    }
+
+    fn on_request_finish(
+        &self,
+        worker: &Arc<dyn Worker>,
+        _context: &RoutingContext,
+        outcome: RequestOutcome,
+    ) {
+        worker.decrement_load();
+        RouterMetrics::set_running_requests(worker.url(), worker.load());
+        self.on_request_complete(worker.url(), outcome.is_success());
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

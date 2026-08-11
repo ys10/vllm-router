@@ -4,24 +4,29 @@
 //! across both regular and prefill-decode (PD) routing modes.
 
 use crate::core::Worker;
+use agent_router::{RequestOutcome, RoutingContext};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
+mod agent_aware;
 mod cache_aware;
 mod consistent_hash;
 mod factory;
 mod hash_key;
+mod lifecycle;
 mod power_of_two;
 mod random;
 mod registry;
 mod rendezvous_hash;
 mod round_robin;
 
+pub use agent_aware::{AgentAwarePolicy, AgentAwareRolloutStats};
 pub use cache_aware::CacheAwarePolicy;
 pub use consistent_hash::ConsistentHashPolicy;
 pub use consistent_hash::VIRTUAL_NODES_PER_WORKER;
 pub use factory::PolicyFactory;
+pub use lifecycle::RequestLifecycle;
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
@@ -61,6 +66,16 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         headers: Option<&RequestHeaders>,
     ) -> Option<usize>;
 
+    /// Select a worker using request metadata that was extracted once before retries.
+    fn select_worker_with_context(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        context: &RoutingContext,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<usize> {
+        self.select_worker_with_headers(workers, context.request_text.as_deref(), headers)
+    }
+
     /// Select a pair of workers (prefill and decode) for PD routing
     ///
     /// Returns indices of (prefill_worker, decode_worker) from their respective arrays.
@@ -95,6 +110,19 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// policies to update their internal state.
     fn on_request_complete(&self, _worker_url: &str, _success: bool) {
         // Default: no-op for stateless policies
+    }
+
+    /// Reserve policy-local state immediately before an attempt is sent.
+    fn on_request_start(&self, _worker: &Arc<dyn Worker>, _context: &RoutingContext) {}
+
+    /// Release policy-local state exactly once when an attempt terminates.
+    fn on_request_finish(
+        &self,
+        worker: &Arc<dyn Worker>,
+        _context: &RoutingContext,
+        outcome: RequestOutcome,
+    ) {
+        self.on_request_complete(worker.url(), outcome.is_success());
     }
 
     /// Get policy name for metrics and debugging

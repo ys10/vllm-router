@@ -1,3 +1,4 @@
+use agent_router::RoutingContext;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -539,6 +540,16 @@ impl GenerationRequest for ChatCompletionRequest {
         self.model.as_deref()
     }
 
+    fn routing_session_params(&self) -> Option<&HashMap<String, serde_json::Value>> {
+        self.session_params.as_ref()
+    }
+
+    fn routing_max_decode_tokens(&self) -> Option<u64> {
+        self.max_completion_tokens
+            .or(self.max_tokens)
+            .map(u64::from)
+    }
+
     fn extract_text_for_routing(&self) -> String {
         // Use session_id from session_params for session-based routing
         if let Some(ref session_params) = self.session_params {
@@ -759,6 +770,14 @@ impl GenerationRequest for CompletionRequest {
 
     fn get_model(&self) -> Option<&str> {
         self.model.as_deref()
+    }
+
+    fn routing_session_params(&self) -> Option<&HashMap<String, serde_json::Value>> {
+        self.session_params.as_ref()
+    }
+
+    fn routing_max_decode_tokens(&self) -> Option<u64> {
+        self.max_tokens.map(u64::from)
     }
 
     fn extract_text_for_routing(&self) -> String {
@@ -1336,6 +1355,14 @@ impl GenerationRequest for ResponsesRequest {
 
     fn get_model(&self) -> Option<&str> {
         self.model.as_deref()
+    }
+
+    fn routing_request_id(&self) -> Option<&str> {
+        Some(&self.request_id)
+    }
+
+    fn routing_max_decode_tokens(&self) -> Option<u64> {
+        self.max_output_tokens.map(u64::from)
     }
 
     fn extract_text_for_routing(&self) -> String {
@@ -1937,6 +1964,33 @@ impl GenerationRequest for GenerateRequest {
         None
     }
 
+    fn routing_request_id(&self) -> Option<&str> {
+        self.rid.as_deref()
+    }
+
+    fn routing_session_params(&self) -> Option<&HashMap<String, serde_json::Value>> {
+        self.session_params.as_ref()
+    }
+
+    fn routing_prompt_tokens(&self) -> Option<u64> {
+        match self.input_ids.as_ref()? {
+            InputIds::Single(tokens) => tokens.len().try_into().ok(),
+            InputIds::Batch(_) => None,
+        }
+    }
+
+    fn routing_max_decode_tokens(&self) -> Option<u64> {
+        self.sampling_params
+            .as_ref()
+            .and_then(|params| params.max_new_tokens)
+            .or_else(|| {
+                self.parameters
+                    .as_ref()
+                    .and_then(|params| params.max_new_tokens)
+            })
+            .map(u64::from)
+    }
+
     fn extract_text_for_routing(&self) -> String {
         // Check fields in priority order: text, prompt, inputs
         if let Some(ref text) = self.text {
@@ -1995,6 +2049,10 @@ impl GenerationRequest for InferenceGenerateRequest {
 
     fn get_model(&self) -> Option<&str> {
         self.model.as_deref()
+    }
+
+    fn routing_prompt_tokens(&self) -> Option<u64> {
+        self.token_ids.len().try_into().ok()
     }
 
     fn extract_text_for_routing(&self) -> String {
@@ -2282,6 +2340,43 @@ pub trait GenerationRequest: Send + Sync {
 
     /// Extract text content for routing decisions
     fn extract_text_for_routing(&self) -> String;
+
+    fn routing_request_id(&self) -> Option<&str> {
+        None
+    }
+
+    fn routing_session_params(&self) -> Option<&HashMap<String, serde_json::Value>> {
+        None
+    }
+
+    fn routing_prompt_tokens(&self) -> Option<u64> {
+        None
+    }
+
+    fn routing_max_decode_tokens(&self) -> Option<u64> {
+        None
+    }
+
+    fn routing_context(&self, route: &str, model_id: Option<&str>) -> RoutingContext {
+        let model_id = model_id.or_else(|| self.get_model()).map(str::to_string);
+        let mut context = RoutingContext::new(
+            route,
+            model_id,
+            Some(self.extract_text_for_routing()),
+            self.is_stream(),
+        )
+        .with_session_params(self.routing_session_params());
+        if let Some(request_id) = self.routing_request_id() {
+            context = context.with_request_id(request_id);
+        }
+        if let Some(prompt_tokens) = self.routing_prompt_tokens() {
+            context = context.with_prompt_tokens(prompt_tokens);
+        }
+        if let Some(max_decode_tokens) = self.routing_max_decode_tokens() {
+            context = context.with_decode_tokens(max_decode_tokens);
+        }
+        context
+    }
 }
 
 /// Helper type for string or array of strings

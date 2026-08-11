@@ -2,6 +2,8 @@ use super::ConfigResult;
 use crate::config::validation::ConfigValidator;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::convert::Infallible;
+use std::str::FromStr;
 
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,6 +211,151 @@ impl RoutingMode {
 }
 
 /// Policy configuration for routing
+#[derive(Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(transparent)]
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
+impl std::fmt::Display for SecretString {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
+impl From<String> for SecretString {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl FromStr for SecretString {
+    type Err = Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self::new(value))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentAwareConfig {
+    pub redis_url: SecretString,
+    pub cluster_id: String,
+    pub cluster_secret: SecretString,
+    #[serde(default)]
+    pub rollout_percent: u8,
+    #[serde(default = "default_agent_balance_abs_threshold_ms")]
+    pub balance_abs_threshold_ms: f64,
+    #[serde(default = "default_agent_balance_rel_threshold")]
+    pub balance_rel_threshold: f64,
+    #[serde(default = "default_agent_dram_block_restore_ms")]
+    pub dram_block_restore_ms: f64,
+    #[serde(default = "default_agent_prefill_tokens")]
+    pub default_prefill_tokens: u64,
+    #[serde(default = "default_agent_decode_tokens")]
+    pub default_decode_tokens: u64,
+    #[serde(default = "default_agent_minimum_reservation_ms")]
+    pub minimum_reservation_ms: u64,
+    #[serde(default = "default_agent_fallback_reservation_ms")]
+    pub fallback_reservation_ms: u64,
+    #[serde(default = "default_agent_metrics_scrape_interval_ms")]
+    pub metrics_scrape_interval_ms: u64,
+    #[serde(default = "default_agent_metrics_timeout_ms")]
+    pub metrics_timeout_ms: u64,
+    #[serde(default = "default_agent_metrics_fresh_ms")]
+    pub metrics_fresh_ms: u64,
+    #[serde(default = "default_agent_expiry_interval_ms")]
+    pub expiry_interval_ms: u64,
+}
+
+impl AgentAwareConfig {
+    pub fn production(
+        redis_url: impl Into<String>,
+        cluster_id: impl Into<String>,
+        cluster_secret: impl Into<String>,
+    ) -> Self {
+        Self {
+            redis_url: SecretString::new(redis_url),
+            cluster_id: cluster_id.into(),
+            cluster_secret: SecretString::new(cluster_secret),
+            rollout_percent: 0,
+            balance_abs_threshold_ms: default_agent_balance_abs_threshold_ms(),
+            balance_rel_threshold: default_agent_balance_rel_threshold(),
+            dram_block_restore_ms: default_agent_dram_block_restore_ms(),
+            default_prefill_tokens: default_agent_prefill_tokens(),
+            default_decode_tokens: default_agent_decode_tokens(),
+            minimum_reservation_ms: default_agent_minimum_reservation_ms(),
+            fallback_reservation_ms: default_agent_fallback_reservation_ms(),
+            metrics_scrape_interval_ms: default_agent_metrics_scrape_interval_ms(),
+            metrics_timeout_ms: default_agent_metrics_timeout_ms(),
+            metrics_fresh_ms: default_agent_metrics_fresh_ms(),
+            expiry_interval_ms: default_agent_expiry_interval_ms(),
+        }
+    }
+}
+
+fn default_agent_balance_abs_threshold_ms() -> f64 {
+    250.0
+}
+
+fn default_agent_balance_rel_threshold() -> f64 {
+    1.2
+}
+
+fn default_agent_dram_block_restore_ms() -> f64 {
+    0.1
+}
+
+fn default_agent_prefill_tokens() -> u64 {
+    512
+}
+
+fn default_agent_decode_tokens() -> u64 {
+    128
+}
+
+fn default_agent_minimum_reservation_ms() -> u64 {
+    1
+}
+
+fn default_agent_fallback_reservation_ms() -> u64 {
+    100
+}
+
+fn default_agent_metrics_scrape_interval_ms() -> u64 {
+    1_000
+}
+
+fn default_agent_metrics_timeout_ms() -> u64 {
+    500
+}
+
+fn default_agent_metrics_fresh_ms() -> u64 {
+    3_000
+}
+
+fn default_agent_expiry_interval_ms() -> u64 {
+    500
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum PolicyConfig {
@@ -246,6 +393,9 @@ pub enum PolicyConfig {
 
     #[serde(rename = "rendezvous_hash")]
     RendezvousHash,
+
+    #[serde(rename = "agent_aware")]
+    AgentAware { config: Box<AgentAwareConfig> },
 }
 
 impl PolicyConfig {
@@ -257,6 +407,7 @@ impl PolicyConfig {
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::ConsistentHash { .. } => "consistent_hash",
             PolicyConfig::RendezvousHash => "rendezvous_hash",
+            PolicyConfig::AgentAware { .. } => "agent_aware",
         }
     }
 }

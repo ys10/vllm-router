@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "message_type": "session_placement",
+  "seq": 43,
+  "observed_at_ms": 1786032000000,
+  "expires_at_ms": 1786032060000,
+  "server": {
+    "cluster_id": "prod-a",
+    "server_id": "decode-worker-7",
+    "instance_id": "123e4567-e89b-42d3-a456-426614174000",
+    "model_id": "Qwen3-32B",
+    "model_revision": "sha256:0123456789abcdef",
+    "tokenizer_revision": "sha256:fedcba9876543210",
+    "role": "unified",
+    "dp_rank": 0,
+    "endpoint": "http://10.0.0.17:8000"
+  },
+  "payload": {
+    "session_key": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "session_epoch": 3,
+    "prefix_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "cached_prefix_tokens": 4000,
+    "block_size_tokens": 256,
+    "hbm_blocks": 12,
+    "dram_blocks": 4,
+    "hbm_cached_tokens": 3072,
+    "dram_cached_tokens": 928
+  }
+}

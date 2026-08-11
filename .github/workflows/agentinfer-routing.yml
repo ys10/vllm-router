@@ -1,0 +1,64 @@
+name: AgentInfer routing
+
+"on":
+  push:
+    branches:
+      - dev
+    paths:
+      - ".github/workflows/agentinfer-routing.yml"
+      - "agent_router/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "src/**"
+      - "tests/agentinfer_*.rs"
+  pull_request:
+    paths:
+      - ".github/workflows/agentinfer-routing.yml"
+      - "agent_router/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "src/**"
+      - "tests/agentinfer_*.rs"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agentinfer-routing-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libzmq3-dev pkg-config redis-server
+
+      - name: Test Agent Router state runtime
+        run: cargo test --locked --manifest-path agent_router/Cargo.toml
+
+      - name: Lint Agent Router state runtime
+        run: >-
+          cargo clippy --locked
+          --manifest-path agent_router/Cargo.toml
+          --all-targets --all-features -- -D warnings
+
+      - name: Test Router library
+        run: cargo test --locked --lib
+
+      - name: Test AgentInfer Router integration
+        run: >-
+          cargo test --locked
+          --test agentinfer_context_lifecycle
+          --test agentinfer_agent_config
+          --test agentinfer_agent_aware_policy
+          --test agentinfer_http_reservations
+
+      - name: Lint Router
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings

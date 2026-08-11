@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "message_type": "server_load",
+  "seq": 42,
+  "observed_at_ms": 1786032000000,
+  "expires_at_ms": 1786032010000,
+  "server": {
+    "cluster_id": "prod-a",
+    "server_id": "decode-worker-7",
+    "instance_id": "123e4567-e89b-42d3-a456-426614174000",
+    "model_id": "Qwen3-32B",
+    "model_revision": "sha256:0123456789abcdef",
+    "tokenizer_revision": "sha256:fedcba9876543210",
+    "role": "unified",
+    "dp_rank": 0,
+    "endpoint": "http://10.0.0.17:8000"
+  },
+  "payload": {
+    "waiting_count": 1,
+    "running_count": 1,
+    "waiting_prefill_tokens": 2048,
+    "waiting_decode_tokens_remaining": 256,
+    "running_prefill_tokens_remaining": 0,
+    "running_decode_tokens_remaining": 128,
+    "prefill_tokens_per_second_ewma": 8200.0,
+    "decode_tokens_per_second_ewma": 1450.0,
+    "kv_cache_usage_ratio": 0.61,
+    "requests": [
+      {
+        "request_key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "state": "waiting",
+        "phase": "prefill",
+        "prefill_tokens_remaining": 2048,
+        "decode_tokens_generated": 0,
+        "decode_tokens_remaining": 256
+      },
+      {
+        "request_key": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "state": "running",
+        "phase": "decode",
+        "prefill_tokens_remaining": 0,
+        "decode_tokens_generated": 64,
+        "decode_tokens_remaining": 128
+      }
+    ]
+  }
+}

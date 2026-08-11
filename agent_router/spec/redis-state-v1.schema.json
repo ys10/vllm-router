@@ -1,0 +1,299 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentinfer.local/schemas/redis-state-v1.schema.json",
+  "title": "AgentInfer Router Redis state protocol v1",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/serverLoad"
+    },
+    {
+      "$ref": "#/$defs/sessionPlacement"
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "server": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cluster_id",
+        "server_id",
+        "instance_id",
+        "model_id",
+        "model_revision",
+        "tokenizer_revision",
+        "role",
+        "dp_rank",
+        "endpoint"
+      ],
+      "properties": {
+        "cluster_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+        },
+        "server_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+        },
+        "instance_id": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        },
+        "model_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "model_revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "tokenizer_revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "role": {
+          "enum": [
+            "unified",
+            "prefill",
+            "decode"
+          ]
+        },
+        "dp_rank": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "endpoint": {
+          "type": "string",
+          "format": "uri"
+        }
+      }
+    },
+    "envelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "message_type",
+        "seq",
+        "observed_at_ms",
+        "expires_at_ms",
+        "server",
+        "payload"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "message_type": {
+          "type": "string"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "observed_at_ms": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "expires_at_ms": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "server": {
+          "$ref": "#/$defs/server"
+        },
+        "payload": {
+          "type": "object"
+        }
+      }
+    },
+    "requestLoad": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "request_key",
+        "state",
+        "phase",
+        "prefill_tokens_remaining",
+        "decode_tokens_generated",
+        "decode_tokens_remaining"
+      ],
+      "properties": {
+        "request_key": {
+          "$ref": "#/$defs/sha256"
+        },
+        "state": {
+          "enum": [
+            "waiting",
+            "running"
+          ]
+        },
+        "phase": {
+          "enum": [
+            "prefill",
+            "decode"
+          ]
+        },
+        "prefill_tokens_remaining": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "decode_tokens_generated": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "decode_tokens_remaining": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "serverLoad": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/envelope"
+        },
+        {
+          "properties": {
+            "message_type": {
+              "const": "server_load"
+            },
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "waiting_count",
+                "running_count",
+                "waiting_prefill_tokens",
+                "waiting_decode_tokens_remaining",
+                "running_prefill_tokens_remaining",
+                "running_decode_tokens_remaining",
+                "prefill_tokens_per_second_ewma",
+                "decode_tokens_per_second_ewma",
+                "kv_cache_usage_ratio",
+                "requests"
+              ],
+              "properties": {
+                "waiting_count": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "running_count": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "waiting_prefill_tokens": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "waiting_decode_tokens_remaining": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "running_prefill_tokens_remaining": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "running_decode_tokens_remaining": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "prefill_tokens_per_second_ewma": {
+                  "type": "number",
+                  "exclusiveMinimum": 0
+                },
+                "decode_tokens_per_second_ewma": {
+                  "type": "number",
+                  "exclusiveMinimum": 0
+                },
+                "kv_cache_usage_ratio": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "requests": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/requestLoad"
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "sessionPlacement": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/envelope"
+        },
+        {
+          "properties": {
+            "message_type": {
+              "const": "session_placement"
+            },
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "session_key",
+                "session_epoch",
+                "prefix_digest",
+                "cached_prefix_tokens",
+                "block_size_tokens",
+                "hbm_blocks",
+                "dram_blocks",
+                "hbm_cached_tokens",
+                "dram_cached_tokens"
+              ],
+              "properties": {
+                "session_key": {
+                  "$ref": "#/$defs/sha256"
+                },
+                "session_epoch": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "prefix_digest": {
+                  "$ref": "#/$defs/sha256"
+                },
+                "cached_prefix_tokens": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "block_size_tokens": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "hbm_blocks": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "dram_blocks": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "hbm_cached_tokens": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "dram_cached_tokens": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

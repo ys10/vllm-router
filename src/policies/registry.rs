@@ -5,8 +5,8 @@
 /// All subsequent workers of the same model use the established policy.
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{
-    CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, LoadBalancingPolicy,
-    PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy, RoundRobinPolicy,
+    AgentAwarePolicy, CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy,
+    LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy, RoundRobinPolicy,
 };
 use crate::config::types::PolicyConfig;
 use std::collections::HashMap;
@@ -173,6 +173,9 @@ impl PolicyRegistry {
             "cache_aware" => Arc::new(CacheAwarePolicy::new()),
             "power_of_two" => Arc::new(PowerOfTwoPolicy::new()),
             "rendezvous_hash" => Arc::new(RendezvousHashPolicy::new()),
+            "agent_aware" if self.default_policy.name() == "agent_aware" => {
+                Arc::clone(&self.default_policy)
+            }
             _ => {
                 warn!("Unknown policy type '{}', using default", policy_type);
                 Arc::clone(&self.default_policy)
@@ -204,7 +207,25 @@ impl PolicyRegistry {
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
             PolicyConfig::ConsistentHash { .. } => Arc::new(ConsistentHashPolicy::new()),
             PolicyConfig::RendezvousHash => Arc::new(RendezvousHashPolicy::new()),
+            PolicyConfig::AgentAware { config } => match AgentAwarePolicy::from_config(config) {
+                Ok(policy) => Arc::new(policy),
+                Err(error) => {
+                    tracing::error!(error = %error, "invalid agent-aware policy; using round-robin");
+                    Arc::new(RoundRobinPolicy::new())
+                }
+            },
         }
+    }
+
+    pub fn start_background_tasks(&self) -> Result<(), String> {
+        if let Some(policy) = self
+            .default_policy
+            .as_any()
+            .downcast_ref::<AgentAwarePolicy>()
+        {
+            policy.start_background_tasks()?;
+        }
+        Ok(())
     }
 
     /// Get current model->policy mappings (for debugging/monitoring)

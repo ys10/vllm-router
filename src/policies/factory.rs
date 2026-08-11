@@ -1,8 +1,8 @@
 //! Factory for creating load balancing policies
 
 use super::{
-    CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, LoadBalancingPolicy,
-    PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy, RoundRobinPolicy,
+    AgentAwarePolicy, CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy,
+    LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy, RoundRobinPolicy,
 };
 use crate::config::PolicyConfig;
 use std::sync::Arc;
@@ -39,6 +39,13 @@ impl PolicyFactory {
                 Arc::new(ConsistentHashPolicy::new())
             }
             PolicyConfig::RendezvousHash => Arc::new(RendezvousHashPolicy::new()),
+            PolicyConfig::AgentAware { config } => match AgentAwarePolicy::from_config(config) {
+                Ok(policy) => Arc::new(policy),
+                Err(error) => {
+                    tracing::error!(error = %error, "invalid agent-aware policy; using round-robin");
+                    Arc::new(RoundRobinPolicy::new())
+                }
+            },
         }
     }
 

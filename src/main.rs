@@ -1,9 +1,9 @@
 use clap::{ArgAction, Parser, ValueEnum};
 use std::collections::HashMap;
 use vllm_router_rs::config::{
-    CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PolicyConfig, RetryConfig,
-    RouterConfig, RoutingMode, TraceConfig,
+    AgentAwareConfig, CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode,
+    DiscoveryConfig, HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PolicyConfig,
+    RetryConfig, RouterConfig, RoutingMode, SecretString, TraceConfig,
 };
 use vllm_router_rs::metrics::PrometheusConfig;
 use vllm_router_rs::server::{self, ServerConfig};
@@ -107,8 +107,36 @@ struct CliArgs {
     worker_urls: Vec<String>,
 
     /// Load balancing policy to use
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash", "agent_aware"])]
     policy: String,
+
+    /// Redis URL for agent-aware routing; prefer AGENT_ROUTER_REDIS_URL
+    #[arg(long)]
+    agent_router_redis_url: Option<SecretString>,
+
+    /// Cluster ID used by the agent-aware Redis protocol
+    #[arg(long)]
+    agent_router_cluster_id: Option<String>,
+
+    /// HMAC secret for session identity; prefer AGENT_ROUTER_CLUSTER_SECRET
+    #[arg(long)]
+    agent_router_cluster_secret: Option<SecretString>,
+
+    /// Absolute projected-load threshold in milliseconds for agent-aware routing
+    #[arg(long, default_value_t = 250.0)]
+    agent_balance_abs_threshold_ms: f64,
+
+    /// Relative projected-load threshold for agent-aware routing
+    #[arg(long, default_value_t = 1.2)]
+    agent_balance_rel_threshold: f64,
+
+    /// Estimated time to restore one DRAM KV block in milliseconds
+    #[arg(long, default_value_t = 0.1)]
+    agent_dram_block_restore_ms: f64,
+
+    /// Agent-aware traffic percentage: 0 is shadow-only; allowed stages are 1, 5, 25, 100
+    #[arg(long, default_value_t = 0)]
+    agent_rollout_percent: u8,
 
     /// Enable vLLM PD (Prefill-Decode) disaggregated mode with vLLM-specific two-stage processing
     #[arg(long, default_value_t = false)]
@@ -373,6 +401,39 @@ impl CliArgs {
                 virtual_nodes: 160, // Default value
             },
             "rendezvous_hash" => PolicyConfig::RendezvousHash,
+            "agent_aware" => {
+                let redis_url = self
+                    .agent_router_redis_url
+                    .clone()
+                    .or_else(|| std::env::var("AGENT_ROUTER_REDIS_URL").ok().map(Into::into))
+                    .unwrap_or_else(|| SecretString::new("redis://127.0.0.1:6379"));
+                let cluster_id = self
+                    .agent_router_cluster_id
+                    .clone()
+                    .or_else(|| std::env::var("AGENT_ROUTER_CLUSTER_ID").ok())
+                    .unwrap_or_else(|| "default".to_string());
+                let cluster_secret = self
+                    .agent_router_cluster_secret
+                    .clone()
+                    .or_else(|| {
+                        std::env::var("AGENT_ROUTER_CLUSTER_SECRET")
+                            .ok()
+                            .map(Into::into)
+                    })
+                    .unwrap_or_else(|| SecretString::new(""));
+                let mut config = AgentAwareConfig::production(
+                    redis_url.expose_secret(),
+                    cluster_id,
+                    cluster_secret.expose_secret(),
+                );
+                config.balance_abs_threshold_ms = self.agent_balance_abs_threshold_ms;
+                config.balance_rel_threshold = self.agent_balance_rel_threshold;
+                config.dram_block_restore_ms = self.agent_dram_block_restore_ms;
+                config.rollout_percent = self.agent_rollout_percent;
+                PolicyConfig::AgentAware {
+                    config: Box::new(config),
+                }
+            }
             _ => PolicyConfig::RoundRobin, // Fallback
         }
     }

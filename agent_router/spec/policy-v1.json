@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "protocol_version": 1,
+  "identity": {
+    "worker_key_fields": [
+      "cluster_id",
+      "server_id",
+      "instance_id",
+      "model_id",
+      "model_revision",
+      "tokenizer_revision",
+      "role",
+      "dp_rank"
+    ],
+    "server_id_scope": "unique_within_cluster",
+    "instance_id_semantics": "uuid_v4_generated_for_every_process_start",
+    "worker_key_semantics": "sha256(concat(u32be(len(utf8(field))) || utf8(field)))",
+    "session_key_semantics": "hmac_sha256(cluster_secret, frame(tenant_id) || frame(session_id))",
+    "prefix_digest_semantics": "sha256(frame(model_revision) || frame(tokenizer_revision) || u64be(token_count) || concat(u32be(token_id)))"
+  },
+  "load_balance": {
+    "absolute_threshold_ms": 250,
+    "relative_threshold": 1.2,
+    "threshold_operator": "and"
+  },
+  "rollout": {
+    "baseline_policy": "round_robin",
+    "default_percent": 0,
+    "allowed_percentages": [0, 1, 5, 25, 100],
+    "bucket_count": 100,
+    "bucket_semantics": "routing_id_mod_100",
+    "decision_scope": "attempt",
+    "pd_router_supported": false
+  },
+  "freshness": {
+    "load_heartbeat_ms": 1000,
+    "load_fresh_ms": 3000,
+    "load_redis_ttl_ms": 10000,
+    "session_heartbeat_ms": 5000,
+    "session_fresh_ms": 15000,
+    "session_redis_ttl_ms": 60000,
+    "max_clock_skew_ms": 2000
+  },
+  "redis": {
+    "key_prefix": "agentinfer:router:v1",
+    "load_snapshot_key": "agentinfer:router:v1:{cluster_id}:worker:{worker_key}:load",
+    "session_snapshot_key": "agentinfer:router:v1:{cluster_id}:session:{session_key}:worker:{worker_key}",
+    "load_index_key": "agentinfer:router:v1:{cluster_id}:load-index",
+    "session_index_key": "agentinfer:router:v1:{cluster_id}:session-placement-index",
+    "events_stream_key": "agentinfer:router:v1:{cluster_id}:events",
+    "stream_max_length": 100000,
+    "stream_retention_ms": 600000
+  }
+}

@@ -5,7 +5,7 @@ use crate::core::{
 };
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
-use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
+use crate::policies::{LoadBalancingPolicy, PolicyRegistry, RequestLifecycle};
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
     InferenceGenerateRequest, RerankRequest, RerankResponse, RerankResult, ResponsesRequest,
@@ -13,6 +13,7 @@ use crate::protocols::spec::{
 use crate::routers::header_utils;
 use crate::routers::http::dp_utils;
 use crate::routers::{RouterTrait, WorkerManagement};
+use agent_router::{RequestOutcome, RoutingContext};
 use axum::body::to_bytes;
 use axum::{
     body::Body,
@@ -28,8 +29,104 @@ use reqwest::Client;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info, warn};
+
+fn request_outcome(status: StatusCode) -> RequestOutcome {
+    if status.is_success() {
+        RequestOutcome::Succeeded
+    } else if is_retryable_status(status) {
+        RequestOutcome::RetryableFailure
+    } else if status.is_client_error() {
+        RequestOutcome::ClientError
+    } else {
+        RequestOutcome::ServerError
+    }
+}
+
+fn insert_router_xarg(
+    xargs: &mut serde_json::Map<String, serde_json::Value>,
+    key: &'static str,
+    value: serde_json::Value,
+) -> Result<(), String> {
+    match xargs.get(key) {
+        Some(existing) if existing != &value => Err(format!(
+            "vllm_xargs.{key} conflicts with Router session metadata"
+        )),
+        Some(_) => Ok(()),
+        None => {
+            xargs.insert(key.to_string(), value);
+            Ok(())
+        }
+    }
+}
+
+fn agent_router_request_json<T: serde::Serialize>(
+    request: &T,
+    context: &RoutingContext,
+) -> Result<serde_json::Value, String> {
+    let mut body = serde_json::to_value(request)
+        .map_err(|error| format!("Convert into serde_json::Value failed: {error}"))?;
+    let Some(session) = context.session.as_ref() else {
+        return Ok(body);
+    };
+    let object = body
+        .as_object_mut()
+        .ok_or_else(|| "typed request must serialize as a JSON object".to_string())?;
+    let xargs_value = object
+        .entry("vllm_xargs")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if xargs_value.is_null() {
+        *xargs_value = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let xargs = xargs_value
+        .as_object_mut()
+        .ok_or_else(|| "vllm_xargs must be a JSON object".to_string())?;
+
+    insert_router_xarg(
+        xargs,
+        "agent_router_tenant_id",
+        serde_json::Value::String(session.tenant_id.clone()),
+    )?;
+    insert_router_xarg(
+        xargs,
+        "agent_router_session_id",
+        serde_json::Value::String(session.session_id.clone()),
+    )?;
+    if let Some(epoch) = session.session_epoch {
+        insert_router_xarg(
+            xargs,
+            "agent_router_session_epoch",
+            serde_json::Value::from(epoch),
+        )?;
+    }
+    if let Some(digest) = session.expected_parent_prefix_digest.as_ref() {
+        insert_router_xarg(
+            xargs,
+            "agent_router_expected_parent_prefix_digest",
+            serde_json::Value::String(digest.clone()),
+        )?;
+    }
+    let request_id = context
+        .request_id
+        .clone()
+        .unwrap_or_else(|| context.routing_id().to_string());
+    insert_router_xarg(
+        xargs,
+        "agent_router_request_id",
+        serde_json::Value::String(request_id),
+    )?;
+    Ok(body)
+}
+
+struct TypedRequestAttempt<'a, T> {
+    headers: Option<&'a HeaderMap>,
+    request: &'a T,
+    context: &'a RoutingContext,
+    route: &'a str,
+    worker_url: &'a str,
+    is_stream: bool,
+}
 
 /// Regular router that uses injected load balancing policies
 #[derive(Debug)]
@@ -54,6 +151,8 @@ impl Router {
         worker_urls: Vec<String>,
         ctx: &Arc<crate::server::AppContext>,
     ) -> Result<Self, String> {
+        ctx.policy_registry.start_background_tasks()?;
+
         // Update active workers gauge
         RouterMetrics::set_active_workers(worker_urls.len());
 
@@ -503,12 +602,29 @@ impl Router {
     }
 
     /// Select worker for a specific model considering circuit breaker state
+    #[cfg(test)]
     fn select_worker_for_model(
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
         headers: Option<&HeaderMap>,
     ) -> Option<Arc<dyn Worker>> {
+        let context = RoutingContext::new(
+            "",
+            model_id.map(str::to_string),
+            text.map(str::to_string),
+            false,
+        );
+        self.select_worker_for_model_with_context(model_id, &context, headers)
+            .map(|(worker, _policy)| worker)
+    }
+
+    fn select_worker_for_model_with_context(
+        &self,
+        model_id: Option<&str>,
+        context: &RoutingContext,
+        headers: Option<&HeaderMap>,
+    ) -> Option<(Arc<dyn Worker>, Arc<dyn LoadBalancingPolicy>)> {
         // Get workers for the specified model (O(1) lookup if model_id is provided)
         let workers = match model_id {
             Some(model) => self.worker_registry.get_by_model_fast(model),
@@ -533,8 +649,9 @@ impl Router {
         // Convert headers for policies that need them (e.g., consistent_hash)
         let request_headers = Self::headers_to_request_headers(headers);
 
-        let idx = policy.select_worker_with_headers(&available, text, request_headers.as_ref())?;
-        Some(available[idx].clone())
+        let idx =
+            policy.select_worker_with_context(&available, context, request_headers.as_ref())?;
+        Some((available[idx].clone(), policy))
     }
 
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
@@ -546,54 +663,38 @@ impl Router {
     ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
-        let text = typed_req.extract_text_for_routing();
+        let context = Arc::new(typed_req.routing_context(route, model_id));
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             // operation per attempt
             |_: u32| async {
-                let worker = match self.select_worker_for_model(model_id, Some(&text), headers) {
-                    Some(w) => w,
-                    None => {
-                        RouterMetrics::record_request_error(route, "no_available_workers");
-                        return (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "No available workers (all circuits open or unhealthy)",
-                        )
-                            .into_response();
-                    }
-                };
+                let (worker, policy) =
+                    match self.select_worker_for_model_with_context(model_id, &context, headers) {
+                        Some(selection) => selection,
+                        None => {
+                            RouterMetrics::record_request_error(route, "no_available_workers");
+                            return (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "No available workers (all circuits open or unhealthy)",
+                            )
+                                .into_response();
+                        }
+                    };
 
-                // Optional load tracking for cache-aware policy
-                // Get the policy for this model to check if it's cache-aware
-                let policy = match model_id {
-                    Some(model) => self.policy_registry.get_policy_or_default(model),
-                    None => self.policy_registry.get_default_policy(),
-                };
-
-                let load_incremented = if policy.name() == "cache_aware" {
-                    worker.increment_load();
-                    RouterMetrics::set_running_requests(worker.url(), worker.load());
-                    true
-                } else {
-                    false
-                };
-
-                // Keep a clone for potential cleanup on retry
-                let worker_for_cleanup = if load_incremented {
-                    Some(worker.clone())
-                } else {
-                    None
-                };
+                let lifecycle = RequestLifecycle::start(policy, worker.clone(), context.clone());
 
                 let response = self
                     .send_typed_request(
-                        headers,
-                        typed_req,
-                        route,
-                        worker.url(),
-                        is_stream,
-                        load_incremented,
+                        TypedRequestAttempt {
+                            headers,
+                            request: typed_req,
+                            context: &context,
+                            route,
+                            worker_url: worker.url(),
+                            is_stream,
+                        },
+                        lifecycle,
                     )
                     .await;
 
@@ -601,18 +702,6 @@ impl Router {
                 // should count against the circuit breaker.
                 let status = response.status();
                 worker.record_outcome(status.is_success() || status.is_client_error());
-
-                // For retryable failures, we need to decrement load since send_typed_request
-                // won't have done it (it only decrements on success or non-retryable failures)
-                if is_retryable_status(response.status()) && load_incremented {
-                    if let Some(cleanup_worker) = worker_for_cleanup {
-                        cleanup_worker.decrement_load();
-                        RouterMetrics::set_running_requests(
-                            cleanup_worker.url(),
-                            cleanup_worker.load(),
-                        );
-                    }
-                }
 
                 response
             },
@@ -766,51 +855,42 @@ impl Router {
     // Send typed request directly without conversion
     async fn send_typed_request<T: serde::Serialize>(
         &self,
-        headers: Option<&HeaderMap>,
-        typed_req: &T,
-        route: &str,
-        worker_url: &str,
-        is_stream: bool,
-        load_incremented: bool, // Whether load was incremented for this request
+        attempt: TypedRequestAttempt<'_, T>,
+        mut lifecycle: RequestLifecycle,
     ) -> Response {
+        let json_val = match agent_router_request_json(attempt.request, attempt.context) {
+            Ok(value) => value,
+            Err(error) => {
+                lifecycle.finish(RequestOutcome::ClientError);
+                return (StatusCode::BAD_REQUEST, error).into_response();
+            }
+        };
         let (mut request_builder, extracted_dp_rank, request_url) =
             if self.intra_node_data_parallel_size > 1 {
-                let (worker_url_prefix, dp_rank) = match dp_utils::extract_dp_rank(worker_url) {
-                    Ok(tup) => tup,
-                    Err(e) => {
-                        error!("Failed to extract dp_rank: {}", e);
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Failed to extract dp_rank: {}", e),
-                        )
-                            .into_response();
-                    }
-                };
+                let (worker_url_prefix, dp_rank) =
+                    match dp_utils::extract_dp_rank(attempt.worker_url) {
+                        Ok(tup) => tup,
+                        Err(e) => {
+                            lifecycle.finish(RequestOutcome::ServerError);
+                            error!("Failed to extract dp_rank: {}", e);
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("Failed to extract dp_rank: {}", e),
+                            )
+                                .into_response();
+                        }
+                    };
 
-                // Parse the request body
-                let json_val = match serde_json::to_value(typed_req) {
-                    Ok(j) => j,
-                    Err(e) => {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            format!("Convert into serde_json::Value failed: {}", e),
-                        )
-                            .into_response();
-                    }
-                };
-
-                // Use the original json_val without modification
-
-                let request_url = format!("{}{}", worker_url_prefix, route);
+                let request_url = format!("{}{}", worker_url_prefix, attempt.route);
                 (
                     self.client.post(&request_url).json(&json_val),
                     Some(dp_rank),
                     request_url,
                 )
             } else {
-                let request_url = format!("{}{}", worker_url, route);
+                let request_url = format!("{}{}", attempt.worker_url, attempt.route);
                 (
-                    self.client.post(&request_url).json(typed_req),
+                    self.client.post(&request_url).json(&json_val),
                     None,
                     request_url,
                 )
@@ -819,7 +899,7 @@ impl Router {
         // Copy all headers from original request if provided, skipping
         // Content-Type/Content-Length (.json() sets them) and trace headers
         // (propagate_trace_headers below injects fresh context).
-        if let Some(headers) = headers {
+        if let Some(headers) = attempt.headers {
             for (name, value) in headers {
                 if *name != CONTENT_TYPE
                     && *name != CONTENT_LENGTH
@@ -839,11 +919,11 @@ impl Router {
 
         let res = match otel_http::send_client_request(
             request_builder,
-            headers,
+            attempt.headers,
             ClientRequestOptions {
                 method: "POST",
                 url: &request_url,
-                route: Some(route),
+                route: Some(attempt.route),
                 request_phase: Some("inference"),
             },
         )
@@ -853,16 +933,10 @@ impl Router {
             Err(e) => {
                 error!(
                     "Failed to send typed request worker_url={} route={} error={}",
-                    worker_url, route, e
+                    attempt.worker_url, attempt.route, e
                 );
 
-                // Decrement load on error if it was incremented
-                if load_incremented {
-                    if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                        worker.decrement_load();
-                        RouterMetrics::set_running_requests(worker_url, worker.load());
-                    }
-                }
+                lifecycle.finish(RequestOutcome::TransportError);
 
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -875,126 +949,78 @@ impl Router {
         let status = StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
-        if !is_stream {
+        if !attempt.is_stream {
             // For non-streaming requests, preserve headers
             let response_headers = header_utils::preserve_response_headers(res.headers());
 
-            let response = match res.bytes().await {
+            match res.bytes().await {
                 Ok(body) => {
                     let mut response = Response::new(axum::body::Body::from(body));
                     *response.status_mut() = status;
                     *response.headers_mut() = response_headers;
+                    lifecycle.finish(request_outcome(status));
                     response
                 }
                 Err(e) => {
-                    // IMPORTANT: Decrement load on error before returning
-                    if load_incremented {
-                        if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                            worker.decrement_load();
-                            RouterMetrics::set_running_requests(worker_url, worker.load());
-                        }
-                    }
-
+                    lifecycle.finish(RequestOutcome::TransportError);
                     let error_msg = format!("Failed to get response body: {}", e);
                     (StatusCode::INTERNAL_SERVER_ERROR, error_msg).into_response()
                 }
-            };
-
-            // Decrement load counter for non-streaming requests if it was incremented
-            if load_incremented {
-                if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                    worker.decrement_load();
-                    RouterMetrics::set_running_requests(worker_url, worker.load());
-                }
             }
-
-            response
-        } else if load_incremented {
-            // For streaming with load tracking, we need to manually decrement when done
-            let registry = Arc::clone(&self.worker_registry);
-            let worker_url = worker_url.to_string();
-
-            // Preserve headers for streaming response
+        } else {
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            // Ensure we set the correct content-type for SSE
             response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
 
-            let stream = res.bytes_stream();
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            if is_retryable_status(status) {
+                lifecycle.finish(RequestOutcome::RetryableFailure);
+                let mut response = Response::new(Body::from_stream(res.bytes_stream()));
+                *response.status_mut() = status;
+                *response.headers_mut() = response_headers;
+                return response;
+            }
 
-            // Spawn task to forward stream and detect completion
+            let completed_outcome = request_outcome(status);
+            let stream = res.bytes_stream();
+            let (tx, rx) = tokio::sync::mpsc::channel(16);
+
             tokio::spawn(async move {
                 let mut stream = stream;
-                let mut decremented = false;
-                while let Some(chunk) = stream.next().await {
+                loop {
+                    let chunk = tokio::select! {
+                        _ = tx.closed() => {
+                            lifecycle.finish(RequestOutcome::Cancelled);
+                            return;
+                        }
+                        chunk = stream.next() => chunk,
+                    };
+                    let Some(chunk) = chunk else {
+                        break;
+                    };
                     match chunk {
                         Ok(bytes) => {
-                            // Check for stream end marker
                             if bytes
                                 .as_ref()
                                 .windows(12)
                                 .any(|window| window == b"data: [DONE]")
                             {
-                                if let Some(worker) = registry.get_by_url(&worker_url) {
-                                    worker.decrement_load();
-                                    RouterMetrics::set_running_requests(&worker_url, worker.load());
-                                    decremented = true;
-                                }
+                                lifecycle.finish(completed_outcome);
                             }
-                            if tx.send(Ok(bytes)).is_err() {
-                                break;
+                            if tx.send(Ok(bytes)).await.is_err() {
+                                lifecycle.finish(RequestOutcome::Cancelled);
+                                return;
                             }
                         }
                         Err(e) => {
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
-                            break;
+                            lifecycle.finish(RequestOutcome::TransportError);
+                            let _ = tx.send(Err(format!("Stream error: {}", e))).await;
+                            return;
                         }
                     }
                 }
-                if !decremented {
-                    if let Some(worker) = registry.get_by_url(&worker_url) {
-                        worker.decrement_load();
-                        RouterMetrics::set_running_requests(&worker_url, worker.load());
-                    }
-                }
+                lifecycle.finish(completed_outcome);
             });
 
-            let stream = UnboundedReceiverStream::new(rx);
-            let body = Body::from_stream(stream);
-
-            let mut response = Response::new(body);
-            *response.status_mut() = status;
-            *response.headers_mut() = response_headers;
-            response
-        } else {
-            // For requests without load tracking, just stream
-            // Preserve headers for streaming response
-            let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            // Ensure we set the correct content-type for SSE
-            response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-
-            let stream = res.bytes_stream();
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-            // Spawn task to forward stream
-            tokio::spawn(async move {
-                let mut stream = stream;
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            if tx.send(Ok(bytes)).is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
-                            break;
-                        }
-                    }
-                }
-            });
-
-            let stream = UnboundedReceiverStream::new(rx);
+            let stream = ReceiverStream::new(rx);
             let body = Body::from_stream(stream);
 
             let mut response = Response::new(body);
@@ -2215,4 +2241,64 @@ mod tests {
 
         health_checker.shutdown().await;
     }
+}
+#[test]
+fn test_agent_router_metadata_is_merged_into_vllm_xargs() {
+    let request = serde_json::json!({
+        "model": "model-a",
+        "vllm_xargs": {"existing": "preserved"},
+        "session_params": {
+            "tenant_id": "tenant-a",
+            "session_id": "session-a",
+            "session_epoch": 3,
+            "expected_parent_prefix_digest": "a".repeat(64)
+        }
+    });
+    let context = RoutingContext::new(
+        "/v1/chat/completions",
+        Some("model-a".to_string()),
+        None,
+        false,
+    )
+    .with_request_id("request-a")
+    .with_session(agent_router::SessionContext {
+        tenant_id: "tenant-a".to_string(),
+        session_id: "session-a".to_string(),
+        session_epoch: Some(3),
+        expected_parent_prefix_digest: Some("a".repeat(64)),
+        model_revision: Some("revision-a".to_string()),
+        tokenizer_revision: Some("tokenizer-a".to_string()),
+    });
+
+    let forwarded = agent_router_request_json(&request, &context).unwrap();
+    let xargs = forwarded["vllm_xargs"].as_object().unwrap();
+
+    assert_eq!(xargs["existing"], "preserved");
+    assert_eq!(xargs["agent_router_tenant_id"], "tenant-a");
+    assert_eq!(xargs["agent_router_session_id"], "session-a");
+    assert_eq!(xargs["agent_router_session_epoch"], 3);
+    assert_eq!(
+        xargs["agent_router_expected_parent_prefix_digest"],
+        "a".repeat(64)
+    );
+    assert_eq!(xargs["agent_router_request_id"], "request-a");
+    assert!(forwarded.get("session_params").is_some());
+}
+
+#[test]
+fn test_agent_router_metadata_rejects_conflicting_xargs() {
+    let request = serde_json::json!({
+        "vllm_xargs": {"agent_router_tenant_id": "spoofed"}
+    });
+    let context = RoutingContext::default().with_session(agent_router::SessionContext {
+        tenant_id: "tenant-a".to_string(),
+        session_id: "session-a".to_string(),
+        session_epoch: Some(0),
+        expected_parent_prefix_digest: None,
+        model_revision: None,
+        tokenizer_revision: None,
+    });
+
+    let error = agent_router_request_json(&request, &context).unwrap_err();
+    assert!(error.contains("agent_router_tenant_id"));
 }

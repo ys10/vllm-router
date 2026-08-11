@@ -26,6 +26,7 @@ pub enum PolicyType {
     CacheAware,
     PowerOfTwo,
     ConsistentHash,
+    AgentAware,
 }
 
 #[pyclass]
@@ -103,7 +104,8 @@ impl Router {
     /// Convert PyO3 Router to RouterConfig
     pub fn to_router_config(&self) -> config::ConfigResult<config::RouterConfig> {
         use config::{
-            DiscoveryConfig, MetricsConfig, PolicyConfig as ConfigPolicyConfig, RoutingMode,
+            AgentAwareConfig, DiscoveryConfig, MetricsConfig, PolicyConfig as ConfigPolicyConfig,
+            RoutingMode,
         };
 
         // Convert policy helper function
@@ -124,6 +126,21 @@ impl Router {
                 PolicyType::ConsistentHash => ConfigPolicyConfig::ConsistentHash {
                     virtual_nodes: 160, // Default value
                 },
+                PolicyType::AgentAware => {
+                    let mut config = AgentAwareConfig::production(
+                        std::env::var("AGENT_ROUTER_REDIS_URL")
+                            .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string()),
+                        std::env::var("AGENT_ROUTER_CLUSTER_ID")
+                            .unwrap_or_else(|_| "default".to_string()),
+                        std::env::var("AGENT_ROUTER_CLUSTER_SECRET").unwrap_or_default(),
+                    );
+                    config.rollout_percent = std::env::var("AGENT_ROUTER_ROLLOUT_PERCENT")
+                        .ok()
+                        .map_or(0, |value| value.parse().unwrap_or(u8::MAX));
+                    ConfigPolicyConfig::AgentAware {
+                        config: Box::new(config),
+                    }
+                }
             }
         };
 

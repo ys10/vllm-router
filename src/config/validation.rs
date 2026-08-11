@@ -191,6 +191,94 @@ impl ConfigValidator {
             PolicyConfig::RendezvousHash => {
                 // No specific validation needed
             }
+            PolicyConfig::AgentAware { config } => {
+                agent_router::RolloutPercent::new(config.rollout_percent).map_err(|error| {
+                    ConfigError::InvalidValue {
+                        field: "agent_aware.rollout_percent".to_string(),
+                        value: config.rollout_percent.to_string(),
+                        reason: error.to_string(),
+                    }
+                })?;
+                let redis_url =
+                    url::Url::parse(config.redis_url.expose_secret()).map_err(|_| {
+                        ConfigError::InvalidValue {
+                            field: "agent_aware.redis_url".to_string(),
+                            value: "<redacted>".to_string(),
+                            reason: "Must be a valid redis:// or rediss:// URL".to_string(),
+                        }
+                    })?;
+                if !matches!(redis_url.scheme(), "redis" | "rediss") {
+                    return Err(ConfigError::InvalidValue {
+                        field: "agent_aware.redis_url".to_string(),
+                        value: "<redacted>".to_string(),
+                        reason: "Must use the redis or rediss scheme".to_string(),
+                    });
+                }
+                if config.cluster_secret.is_empty() {
+                    return Err(ConfigError::MissingRequired {
+                        field: "agent_aware.cluster_secret".to_string(),
+                    });
+                }
+                if config.cluster_id.len() > 128
+                    || !config
+                        .cluster_id
+                        .bytes()
+                        .next()
+                        .is_some_and(|byte| byte.is_ascii_alphanumeric())
+                    || config
+                        .cluster_id
+                        .bytes()
+                        .any(|byte| !(byte.is_ascii_alphanumeric() || b"._-".contains(&byte)))
+                {
+                    return Err(ConfigError::InvalidValue {
+                        field: "agent_aware.cluster_id".to_string(),
+                        value: config.cluster_id.clone(),
+                        reason: "Must match [A-Za-z0-9][A-Za-z0-9._-]{0,127}".to_string(),
+                    });
+                }
+                if !config.balance_abs_threshold_ms.is_finite()
+                    || config.balance_abs_threshold_ms < 0.0
+                {
+                    return Err(ConfigError::InvalidValue {
+                        field: "agent_aware.balance_abs_threshold_ms".to_string(),
+                        value: config.balance_abs_threshold_ms.to_string(),
+                        reason: "Must be finite and >= 0".to_string(),
+                    });
+                }
+                if !config.balance_rel_threshold.is_finite() || config.balance_rel_threshold < 1.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "agent_aware.balance_rel_threshold".to_string(),
+                        value: config.balance_rel_threshold.to_string(),
+                        reason: "Must be finite and >= 1.0".to_string(),
+                    });
+                }
+                if !config.dram_block_restore_ms.is_finite() || config.dram_block_restore_ms < 0.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "agent_aware.dram_block_restore_ms".to_string(),
+                        value: config.dram_block_restore_ms.to_string(),
+                        reason: "Must be finite and >= 0".to_string(),
+                    });
+                }
+                for (field, value) in [
+                    ("minimum_reservation_ms", config.minimum_reservation_ms),
+                    ("fallback_reservation_ms", config.fallback_reservation_ms),
+                    (
+                        "metrics_scrape_interval_ms",
+                        config.metrics_scrape_interval_ms,
+                    ),
+                    ("metrics_timeout_ms", config.metrics_timeout_ms),
+                    ("metrics_fresh_ms", config.metrics_fresh_ms),
+                    ("expiry_interval_ms", config.expiry_interval_ms),
+                ] {
+                    if value == 0 {
+                        return Err(ConfigError::InvalidValue {
+                            field: format!("agent_aware.{field}"),
+                            value: value.to_string(),
+                            reason: "Must be > 0".to_string(),
+                        });
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -386,6 +474,25 @@ impl ConfigValidator {
 
     /// Validate compatibility between different configuration sections
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
+        let has_agent_aware = matches!(&config.policy, PolicyConfig::AgentAware { .. })
+            || match &config.mode {
+                RoutingMode::VllmPrefillDecode {
+                    prefill_policy,
+                    decode_policy,
+                    ..
+                } => {
+                    matches!(prefill_policy, Some(PolicyConfig::AgentAware { .. }))
+                        || matches!(decode_policy, Some(PolicyConfig::AgentAware { .. }))
+                }
+                _ => false,
+            };
+        if has_agent_aware && !matches!(&config.mode, RoutingMode::Regular { .. }) {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "Agent-aware policy currently supports regular HTTP routing only"
+                    .to_string(),
+            });
+        }
+
         // IGW mode is independent - skip other compatibility checks when enabled
         if config.enable_igw {
             return Ok(());
