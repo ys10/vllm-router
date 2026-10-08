@@ -79,6 +79,7 @@
         "schema_version",
         "message_type",
         "cluster_id",
+        "producer_id",
         "state_version",
         "generated_at_ms",
         "hints"
@@ -91,6 +92,9 @@
           "const": "route_hints"
         },
         "cluster_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "producer_id": {
           "$ref": "#/$defs/identifier"
         },
         "state_version": {

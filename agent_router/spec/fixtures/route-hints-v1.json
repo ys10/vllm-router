@@ -2,6 +2,7 @@
   "schema_version": 1,
   "message_type": "route_hints",
   "cluster_id": "prod-a",
+  "producer_id": "apc-6f1c2e0a",
   "state_version": 42,
   "generated_at_ms": 1760000000000,
   "hints": [

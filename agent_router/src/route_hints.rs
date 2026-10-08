@@ -45,6 +45,7 @@ pub struct RouteHintsDocument {
     pub schema_version: u8,
     pub message_type: String,
     pub cluster_id: String,
+    pub producer_id: String,
     pub state_version: u64,
     pub generated_at_ms: u64,
     pub hints: Vec<RouteHintPayload>,
@@ -61,6 +62,7 @@ impl RouteHintsDocument {
             ));
         }
         validate_identifier("cluster_id", &self.cluster_id)?;
+        validate_identifier("producer_id", &self.producer_id)?;
         if cluster_id.is_some_and(|expected| expected != self.cluster_id) {
             return Err(StateError::Invalid(
                 "route hints belong to another cluster".into(),
@@ -101,18 +103,29 @@ impl RouteHint {
 /// Routable hints from one accepted document, keyed by session key.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RouteHintSet {
+    pub producer_id: String,
     pub document_version: u64,
+    pub generated_at_ms: u64,
     pub hints: BTreeMap<String, RouteHint>,
 }
 
 impl RouteHintSet {
     /// Build the replacement set if `document` is newer than this one.
+    ///
+    /// Versions only order documents from one producer.  A restarted producer
+    /// starts a new version sequence, so a different producer replaces the
+    /// set unless its document was generated before the current one.
     pub fn replacement(
         &self,
         document: &RouteHintsDocument,
         now: ClockReading,
     ) -> Option<RouteHintSet> {
-        if document.state_version <= self.document_version {
+        let newer = if document.producer_id == self.producer_id {
+            document.state_version > self.document_version
+        } else {
+            document.generated_at_ms >= self.generated_at_ms
+        };
+        if !newer {
             return None;
         }
         let mut hints: BTreeMap<String, RouteHint> = BTreeMap::new();
@@ -144,7 +157,9 @@ impl RouteHintSet {
             }
         }
         Some(RouteHintSet {
+            producer_id: document.producer_id.clone(),
             document_version: document.state_version,
+            generated_at_ms: document.generated_at_ms,
             hints,
         })
     }

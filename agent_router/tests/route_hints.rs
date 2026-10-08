@@ -35,12 +35,22 @@ fn hint(
 }
 
 fn document(version: u64, hints: Vec<serde_json::Value>) -> String {
+    document_from("apc-a", version, NOW_UNIX_MS, hints)
+}
+
+fn document_from(
+    producer: &str,
+    version: u64,
+    generated_at_ms: u64,
+    hints: Vec<serde_json::Value>,
+) -> String {
     json!({
         "schema_version": 1,
         "message_type": "route_hints",
         "cluster_id": CLUSTER,
+        "producer_id": producer,
         "state_version": version,
-        "generated_at_ms": NOW_UNIX_MS,
+        "generated_at_ms": generated_at_ms,
         "hints": hints,
     })
     .to_string()
@@ -364,4 +374,61 @@ async fn ack_publisher_retries_and_writes_protocol_json() {
     assert_eq!(publisher.failed(), 0);
     shutdown_tx.send(true).unwrap();
     task.await.unwrap();
+}
+
+#[test]
+fn restarted_producer_replaces_hints_despite_a_lower_version() {
+    let (_, store) = store();
+    store.apply_route_hint_batch(
+        &[document_from(
+            "apc-old",
+            90,
+            NOW_UNIX_MS,
+            vec![hint(1, "vllm-p1", "ready", 10_000, 90)],
+        )],
+        CLUSTER,
+    );
+
+    let report = store.apply_route_hint_batch(
+        &[document_from(
+            "apc-new",
+            1,
+            NOW_UNIX_MS + 5,
+            vec![hint(2, "vllm-p2", "ready", 10_000, 1)],
+        )],
+        CLUSTER,
+    );
+
+    assert_eq!(report.accepted, 1);
+    let hints = store.snapshot().route_hints.clone();
+    assert_eq!(
+        (hints.producer_id.as_str(), hints.document_version),
+        ("apc-new", 1)
+    );
+    assert_eq!(
+        hints.hints.keys().cloned().collect::<Vec<_>>(),
+        vec![session(2)]
+    );
+}
+
+#[test]
+fn late_document_from_a_replaced_producer_is_ignored() {
+    let (_, store) = store();
+    store.apply_route_hint_batch(
+        &[document_from("apc-new", 1, NOW_UNIX_MS + 5, vec![])],
+        CLUSTER,
+    );
+
+    let report = store.apply_route_hint_batch(
+        &[document_from(
+            "apc-old",
+            91,
+            NOW_UNIX_MS,
+            vec![hint(1, "vllm-p1", "ready", 10_000, 91)],
+        )],
+        CLUSTER,
+    );
+
+    assert_eq!(report.ignored, 1);
+    assert_eq!(store.snapshot().route_hints.producer_id, "apc-new");
 }

@@ -249,6 +249,7 @@ The document conforms to `route-hints-v1.schema.json`:
   "schema_version": 1,
   "message_type": "route_hints",
   "cluster_id": "...",
+  "producer_id": "<AgentRoute process id>",
   "state_version": 42,
   "generated_at_ms": 1760000000000,
   "hints": [
@@ -270,9 +271,13 @@ session placement. `preferred_server` is a Router v1 `server_id`.
 
 ### Ingestion
 
-A document replaces every previously ingested hint when, and only when, its
-`state_version` is greater than the last accepted one; an empty `hints` array
-therefore revokes all hints. Older or equal versions are ignored. Only `ready`
+`state_version` orders documents from one producer. A document from the same
+`producer_id` replaces every previously ingested hint only when its
+`state_version` is greater than the last accepted one; older or equal versions
+are ignored. A restarted AgentRoute process uses a new `producer_id` and a new
+version sequence, so a document from a different producer replaces the set
+unless its `generated_at_ms` is older than the current document's. An empty
+`hints` array revokes all hints. Only `ready`
 and `active` hints are retained. Bootstrap reads the latest snapshot key before
 consuming the event stream with a Router-local cursor, mirroring Router v1
 state.
