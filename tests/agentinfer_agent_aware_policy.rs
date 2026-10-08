@@ -1,8 +1,9 @@
 use agent_router::{
     BalanceThresholds, ClusterSnapshot, FreshValue, HbmDramScorerConfig, ManualClock, MessageType,
-    MetricsSample, MockStateProvider, RequestOutcome, RolloutPercent, RoutingContext,
-    ServerIdentity, ServerLoadPayload, ServerLoadState, SessionContext, SessionPlacementPayload,
-    SessionPlacementState, StateProvider, WorkerRole, WorkerSnapshot,
+    MetricsSample, MockStateProvider, RequestOutcome, RolloutPercent, RouteHint, RouteHintAck,
+    RouteHintAcker, RouteHintState, RoutingContext, ServerIdentity, ServerLoadPayload,
+    ServerLoadState, SessionContext, SessionPlacementPayload, SessionPlacementState, StateProvider,
+    WorkerRole, WorkerSnapshot,
 };
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -102,6 +103,7 @@ fn snapshot_with_loads(worker_a_tokens: u64, worker_b_tokens: u64) -> ClusterSna
             ),
         ]),
         session_placements: BTreeMap::new(),
+        route_hints: Default::default(),
         source_health: Default::default(),
     }
 }
@@ -239,6 +241,7 @@ fn agent_policy_selects_fastest_worker_inside_balanced_subset_and_releases() {
                 fresh_until_monotonic_ms: 15_000,
             },
         )]),
+        route_hints: Default::default(),
         source_health: Default::default(),
     });
 
@@ -422,6 +425,7 @@ fn fallback_reservation_remains_visible_after_state_recovers() {
             ),
         ]),
         session_placements: BTreeMap::new(),
+        route_hints: Default::default(),
         source_health: Default::default(),
     });
     let fresh_context = Arc::new(
@@ -641,4 +645,179 @@ fn worker_selection_reads_one_local_snapshot_without_runtime_io() {
         context,
     );
     lifecycle.finish(RequestOutcome::Succeeded);
+}
+
+const HINT_SECRET: &[u8] = b"cluster-secret";
+
+fn session_context(percent: RolloutPercent, included: bool) -> Arc<RoutingContext> {
+    loop {
+        let context = Arc::new(
+            RoutingContext::new(
+                "/v1/chat/completions",
+                Some("model-a".to_string()),
+                None,
+                false,
+            )
+            .with_prompt_tokens(64)
+            .with_decode_tokens(0)
+            .with_session(SessionContext {
+                tenant_id: "tenant-a".to_string(),
+                session_id: "session-hint".to_string(),
+                session_epoch: Some(1),
+                expected_parent_prefix_digest: None,
+                model_revision: Some("revision-a".to_string()),
+                tokenizer_revision: Some("tokenizer-a".to_string()),
+            }),
+        );
+        if percent.includes(context.routing_id()) == included {
+            return context;
+        }
+    }
+}
+
+fn with_hint(
+    mut snapshot: ClusterSnapshot,
+    context: &RoutingContext,
+    preferred_server: &str,
+    valid_until_monotonic_ms: u64,
+) -> ClusterSnapshot {
+    let session_key = context.session_key(HINT_SECRET).unwrap();
+    snapshot.route_hints.document_version = 9;
+    snapshot.route_hints.hints.insert(
+        session_key.clone(),
+        RouteHint {
+            session_key,
+            source_server: Some("server-a".to_string()),
+            preferred_server: preferred_server.to_string(),
+            plan_id: "plan-1".to_string(),
+            state: RouteHintState::Ready,
+            state_version: 7,
+            valid_until_monotonic_ms,
+        },
+    );
+    snapshot
+}
+
+struct HintHarness {
+    policy: AgentAwarePolicy,
+    acks: tokio::sync::mpsc::Receiver<RouteHintAck>,
+}
+
+fn hint_policy(
+    snapshot: ClusterSnapshot,
+    rollout: RolloutPercent,
+    enable_hints: bool,
+) -> HintHarness {
+    let provider = Arc::new(MockStateProvider::new(Arc::new(ManualClock::new(1_000, 0))));
+    provider.publish(snapshot);
+    let mut policy = AgentAwarePolicy::with_state_provider_and_rollout(
+        provider,
+        HINT_SECRET,
+        BalanceThresholds::new(250.0, 1.2).unwrap(),
+        HbmDramScorerConfig::default(),
+        rollout,
+    )
+    .unwrap();
+    let (acker, acks) = RouteHintAcker::new("cluster-a", "router-test", 8);
+    if enable_hints {
+        policy = policy.with_route_hint_acker(Arc::new(acker));
+    }
+    HintHarness { policy, acks }
+}
+
+const SERVERS: [&str; 2] = ["server-a", "server-b"];
+
+/// Index the policy picks without any hint for the same loads.
+fn unhinted_choice(full: RolloutPercent, context: &Arc<RoutingContext>) -> usize {
+    let harness = hint_policy(snapshot_with_loads(0, 0), full, true);
+    route(&harness.policy, context)
+}
+
+fn route(policy: &AgentAwarePolicy, context: &Arc<RoutingContext>) -> usize {
+    let workers = workers();
+    let selected = policy
+        .select_worker_with_context(&workers, context, None)
+        .unwrap();
+    policy.on_request_finish(&workers[selected], context, RequestOutcome::Succeeded);
+    selected
+}
+
+#[test]
+fn valid_hint_overrides_score_inside_balanced_subset_and_acks_once() {
+    let full = RolloutPercent::new(100).unwrap();
+    let context = session_context(full, true);
+    let hinted = 1 - unhinted_choice(full, &context);
+    let snapshot = with_hint(snapshot_with_loads(0, 0), &context, SERVERS[hinted], 5_000);
+    let mut harness = hint_policy(snapshot, full, true);
+
+    assert_eq!(route(&harness.policy, &context), hinted);
+    assert_eq!(route(&harness.policy, &session_context(full, true)), hinted);
+
+    assert_eq!(harness.policy.route_hint_stats().applied, 2);
+    let ack = harness.acks.try_recv().unwrap();
+    assert_eq!(
+        (ack.plan_id.as_str(), ack.state_version, ack.session_key),
+        ("plan-1", 7, context.session_key(HINT_SECRET).unwrap())
+    );
+    assert!(harness.acks.try_recv().is_err(), "one ACK per hint version");
+}
+
+#[test]
+fn imbalanced_hint_target_is_not_used() {
+    let full = RolloutPercent::new(100).unwrap();
+    let context = session_context(full, true);
+    let snapshot = with_hint(snapshot_with_loads(0, 50_000), &context, "server-b", 5_000);
+    let mut harness = hint_policy(snapshot, full, true);
+
+    assert_eq!(route(&harness.policy, &context), 0);
+    assert_eq!(harness.policy.route_hint_stats().target_imbalanced, 1);
+    assert!(harness.acks.try_recv().is_err());
+}
+
+#[test]
+fn expired_or_unroutable_hints_fall_through_to_normal_scoring() {
+    let full = RolloutPercent::new(100).unwrap();
+    let context = session_context(full, true);
+    let expired = with_hint(snapshot_with_loads(0, 0), &context, "server-b", 0);
+    let mut expired = hint_policy(expired, full, true);
+    let unknown = with_hint(snapshot_with_loads(0, 0), &context, "server-z", 5_000);
+    let mut unknown = hint_policy(unknown, full, true);
+
+    route(&expired.policy, &context);
+    route(&unknown.policy, &session_context(full, true));
+
+    assert_eq!(expired.policy.route_hint_stats().expired, 1);
+    assert_eq!(unknown.policy.route_hint_stats().target_unavailable, 1);
+    assert!(expired.acks.try_recv().is_err());
+    assert!(unknown.acks.try_recv().is_err());
+}
+
+#[test]
+fn shadow_only_rollout_never_acknowledges_a_hint() {
+    let shadow = RolloutPercent::new(0).unwrap();
+    let context = session_context(shadow, false);
+    let snapshot = with_hint(snapshot_with_loads(0, 0), &context, "server-b", 5_000);
+    let mut harness = hint_policy(snapshot, shadow, true);
+
+    route(&harness.policy, &context);
+
+    assert_eq!(harness.policy.route_hint_stats().shadow_only, 1);
+    assert!(harness.acks.try_recv().is_err());
+}
+
+#[test]
+fn hints_are_ignored_unless_enabled() {
+    let full = RolloutPercent::new(100).unwrap();
+    let context = session_context(full, true);
+    let unhinted = unhinted_choice(full, &context);
+    let snapshot = with_hint(
+        snapshot_with_loads(0, 0),
+        &context,
+        SERVERS[1 - unhinted],
+        5_000,
+    );
+    let harness = hint_policy(snapshot, full, false);
+
+    assert_eq!(route(&harness.policy, &context), unhinted);
+    assert_eq!(harness.policy.route_hint_stats(), Default::default());
 }

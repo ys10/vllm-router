@@ -137,6 +137,8 @@ impl Router {
                     config.rollout_percent = std::env::var("AGENT_ROUTER_ROLLOUT_PERCENT")
                         .ok()
                         .map_or(0, |value| value.parse().unwrap_or(u8::MAX));
+                    config.route_hints_enabled =
+                        std::env::var("AGENT_ROUTER_ROUTE_HINTS").is_ok_and(|value| value == "1");
                     ConfigPolicyConfig::AgentAware {
                         config: Box::new(config),
                     }

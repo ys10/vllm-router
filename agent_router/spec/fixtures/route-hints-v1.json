@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "message_type": "route_hints",
+  "cluster_id": "prod-a",
+  "state_version": 42,
+  "generated_at_ms": 1760000000000,
+  "hints": [
+    {
+      "session_key": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "source_server": "vllm-p0",
+      "preferred_server": "vllm-p1",
+      "plan_id": "plan-17",
+      "state": "ready",
+      "valid_until_ms": 1760000005000,
+      "state_version": 41
+    }
+  ]
+}

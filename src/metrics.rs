@@ -380,6 +380,10 @@ impl RouterMetrics {
         .increment(1);
     }
 
+    pub fn record_agent_route_hint(outcome: &'static str) {
+        counter!("vllm_router_agent_route_hint_outcomes_total", "outcome" => outcome).increment(1);
+    }
+
     pub fn record_cache_hit() {
         counter!("vllm_router_cache_hits_total").increment(1);
     }

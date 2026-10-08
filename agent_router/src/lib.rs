@@ -1,3 +1,6 @@
+// `async_trait` marks its boxed futures `#[must_use]`; clippy >= 1.99 flags that.
+#![allow(clippy::double_must_use)]
+
 mod clock;
 mod context;
 mod metrics;
@@ -5,6 +8,8 @@ mod provider;
 mod redis_ingest;
 mod reservation;
 mod rollout;
+mod route_hint_ingest;
+mod route_hints;
 mod routing;
 mod state;
 
@@ -25,6 +30,14 @@ pub use redis_ingest::{
 };
 pub use reservation::{ReservationError, ReservationLedger, ReservationView};
 pub use rollout::{rollout_bucket, RolloutError, RolloutPercent, ROLLOUT_STAGES};
+pub use route_hint_ingest::{
+    RouteHintAckPublisher, RouteHintClientConnector, RouteHintConnection, RouteHintConnector,
+    RouteHintIngestor, RouteHintRedisConfig,
+};
+pub use route_hints::{
+    RouteHint, RouteHintAck, RouteHintAcker, RouteHintOutcome, RouteHintPayload, RouteHintSet,
+    RouteHintState, RouteHintsDocument,
+};
 pub use routing::{
     maximal_balanced_subset, projected_server_load_ms, BalanceThresholds, HbmDramScorer,
     HbmDramScorerConfig, RequestScore, RequestScorer, RoutingError,

@@ -1,4 +1,5 @@
 use crate::metrics::{MetricsPublisher, MetricsSample};
+use crate::route_hints::{RouteHintSet, RouteHintsDocument};
 use crate::state::{
     IngestMode, ServerIdentity, ServerLoadState, SessionPlacementState, StateError,
 };
@@ -14,6 +15,7 @@ pub struct ClusterSnapshot {
     pub published_at_unix_ms: u64,
     pub workers: BTreeMap<String, WorkerSnapshot>,
     pub session_placements: BTreeMap<String, FreshValue<SessionPlacementState>>,
+    pub route_hints: RouteHintSet,
     pub source_health: SourceHealth,
 }
 
@@ -120,6 +122,7 @@ struct MutableState {
     workers: BTreeMap<String, WorkerSnapshot>,
     session_placements: BTreeMap<String, FreshValue<SessionPlacementState>>,
     latest_sequence: BTreeMap<String, u64>,
+    route_hints: RouteHintSet,
     source_health: SourceHealth,
 }
 
@@ -190,10 +193,49 @@ impl SnapshotStore {
         report
     }
 
+    /// Apply AgentRoute route-hint documents; only a newer version replaces hints.
+    pub fn apply_route_hint_batch(
+        &self,
+        messages: &[String],
+        cluster_id: &str,
+    ) -> ApplyBatchReport {
+        let now = self.shared.clock.now();
+        let mut report = ApplyBatchReport::default();
+        let mut state = self.shared.state.lock().expect("snapshot store poisoned");
+        let mut changed = false;
+        for raw in messages {
+            let document = match serde_json::from_str::<RouteHintsDocument>(raw) {
+                Ok(document) => document,
+                Err(error) => {
+                    tracing::warn!(error = %error, "discarding malformed route-hint document");
+                    report.invalid += 1;
+                    continue;
+                }
+            };
+            if let Err(error) = document.validate(Some(cluster_id)) {
+                tracing::warn!(error = %error, "discarding invalid route-hint document");
+                report.invalid += 1;
+                continue;
+            }
+            match state.route_hints.replacement(&document, now) {
+                Some(replacement) => {
+                    state.route_hints = replacement;
+                    report.accepted += 1;
+                    changed = true;
+                }
+                None => report.ignored += 1,
+            }
+        }
+        if changed {
+            self.publish_locked(&mut state, now.unix_ms);
+        }
+        report
+    }
+
     pub fn expire_stale(&self) -> bool {
         let now = self.shared.clock.now();
         let mut state = self.shared.state.lock().expect("snapshot store poisoned");
-        let mut changed = false;
+        let mut changed = state.route_hints.expire(now.monotonic_ms);
         for worker in state.workers.values_mut() {
             if worker
                 .load
@@ -281,6 +323,7 @@ impl SnapshotStore {
             published_at_unix_ms: unix_ms,
             workers: state.workers.clone(),
             session_placements: state.session_placements.clone(),
+            route_hints: state.route_hints.clone(),
             source_health: state.source_health.clone(),
         }));
     }

@@ -1,0 +1,155 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentinfer.local/schemas/route-hints-v1.schema.json",
+  "title": "AgentInfer AgentRoute route-hint protocol v1",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/routeHints"
+    },
+    {
+      "$ref": "#/$defs/routeHintAck"
+    }
+  ],
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "nonEmpty": {
+      "type": "string",
+      "minLength": 1
+    },
+    "unsigned": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "hint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "session_key",
+        "source_server",
+        "preferred_server",
+        "plan_id",
+        "state",
+        "valid_until_ms",
+        "state_version"
+      ],
+      "properties": {
+        "session_key": {
+          "$ref": "#/$defs/sha256"
+        },
+        "source_server": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/identifier"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "preferred_server": {
+          "$ref": "#/$defs/identifier"
+        },
+        "plan_id": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "state": {
+          "enum": [
+            "preparing",
+            "ready",
+            "active",
+            "expired",
+            "cancelled"
+          ]
+        },
+        "valid_until_ms": {
+          "$ref": "#/$defs/unsigned"
+        },
+        "state_version": {
+          "$ref": "#/$defs/unsigned"
+        }
+      }
+    },
+    "routeHints": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "message_type",
+        "cluster_id",
+        "state_version",
+        "generated_at_ms",
+        "hints"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "message_type": {
+          "const": "route_hints"
+        },
+        "cluster_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "state_version": {
+          "$ref": "#/$defs/unsigned"
+        },
+        "generated_at_ms": {
+          "$ref": "#/$defs/unsigned"
+        },
+        "hints": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/hint"
+          }
+        }
+      }
+    },
+    "routeHintAck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "message_type",
+        "cluster_id",
+        "router_id",
+        "plan_id",
+        "session_key",
+        "state_version",
+        "observed_at_ms"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "message_type": {
+          "const": "route_hint_ack"
+        },
+        "cluster_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "router_id": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "plan_id": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "session_key": {
+          "$ref": "#/$defs/sha256"
+        },
+        "state_version": {
+          "$ref": "#/$defs/unsigned"
+        },
+        "observed_at_ms": {
+          "$ref": "#/$defs/unsigned"
+        }
+      }
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}

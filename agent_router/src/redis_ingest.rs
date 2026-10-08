@@ -4,7 +4,7 @@ use redis::streams::{StreamRangeReply, StreamReadReply};
 use std::sync::Arc;
 use std::time::Duration;
 
-const STREAM_FIELD: &str = "data";
+pub(crate) const STREAM_FIELD: &str = "data";
 
 #[derive(Clone)]
 pub struct RedisIngestConfig {
@@ -40,21 +40,7 @@ impl RedisIngestConfig {
     }
 
     fn key_prefix(&self) -> Result<String, RedisIngestError> {
-        if self.cluster_id.len() > 128
-            || !self
-                .cluster_id
-                .bytes()
-                .next()
-                .is_some_and(|byte| byte.is_ascii_alphanumeric())
-            || self
-                .cluster_id
-                .bytes()
-                .any(|byte| !(byte.is_ascii_alphanumeric() || b"._-".contains(&byte)))
-        {
-            return Err(RedisIngestError::Protocol(
-                "cluster_id must match [A-Za-z0-9][A-Za-z0-9._-]*".into(),
-            ));
-        }
+        validate_cluster_id(&self.cluster_id)?;
         Ok(format!("agentinfer:router:v1:{{{}}}", self.cluster_id))
     }
 
@@ -132,21 +118,7 @@ impl RedisStateConnection for RedisConnection {
         config: &RedisIngestConfig,
         now_unix_ms: u64,
     ) -> Result<RedisReadBatch, RedisIngestError> {
-        let stream_key = config.stream_key()?;
-        let tail: StreamRangeReply = redis::cmd("XREVRANGE")
-            .arg(&stream_key)
-            .arg("+")
-            .arg("-")
-            .arg("COUNT")
-            .arg(1)
-            .query_async(&mut self.connection)
-            .await
-            .map_err(redis_error)?;
-        let cursor = tail
-            .ids
-            .first()
-            .map(|entry| entry.id.clone())
-            .unwrap_or_else(|| "0-0".to_string());
+        let cursor = stream_tail(&mut self.connection, &config.stream_key()?).await?;
 
         let mut messages = Vec::new();
         for index_key in config.index_keys()? {
@@ -175,42 +147,95 @@ impl RedisStateConnection for RedisConnection {
         config: &RedisIngestConfig,
         cursor: &str,
     ) -> Result<RedisReadBatch, RedisIngestError> {
-        let stream_key = config.stream_key()?;
-        let block_ms: u64 = config.read_block.as_millis().try_into().unwrap_or(u64::MAX);
-        let reply: StreamReadReply = redis::cmd("XREAD")
-            .arg("COUNT")
-            .arg(256)
-            .arg("BLOCK")
-            .arg(block_ms)
-            .arg("STREAMS")
-            .arg(stream_key)
-            .arg(cursor)
-            .query_async(&mut self.connection)
-            .await
-            .map_err(redis_error)?;
-        let mut next_cursor = cursor.to_string();
-        let mut messages = Vec::new();
-        for key in reply.keys {
-            for entry in key.ids {
-                next_cursor = entry.id.clone();
-                match entry.get::<String>(STREAM_FIELD) {
-                    Some(message) => messages.push(message),
-                    None => tracing::warn!(
-                        stream_id = %entry.id,
-                        field = STREAM_FIELD,
-                        "discarding Redis stream entry without state envelope"
-                    ),
-                }
-            }
-        }
-        Ok(RedisReadBatch {
-            cursor: next_cursor,
-            messages,
-        })
+        read_stream_after(
+            &mut self.connection,
+            &config.stream_key()?,
+            cursor,
+            config.read_block,
+        )
+        .await
     }
 }
 
-fn redis_error(error: redis::RedisError) -> RedisIngestError {
+pub(crate) fn validate_cluster_id(cluster_id: &str) -> Result<(), RedisIngestError> {
+    if cluster_id.len() > 128
+        || !cluster_id
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        || cluster_id
+            .bytes()
+            .any(|byte| !(byte.is_ascii_alphanumeric() || b"._-".contains(&byte)))
+    {
+        return Err(RedisIngestError::Protocol(
+            "cluster_id must match [A-Za-z0-9][A-Za-z0-9._-]*".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Latest stream ID, or `0-0` for an empty stream.
+pub(crate) async fn stream_tail(
+    connection: &mut redis::aio::MultiplexedConnection,
+    stream_key: &str,
+) -> Result<String, RedisIngestError> {
+    let tail: StreamRangeReply = redis::cmd("XREVRANGE")
+        .arg(stream_key)
+        .arg("+")
+        .arg("-")
+        .arg("COUNT")
+        .arg(1)
+        .query_async(connection)
+        .await
+        .map_err(redis_error)?;
+    Ok(tail
+        .ids
+        .first()
+        .map(|entry| entry.id.clone())
+        .unwrap_or_else(|| "0-0".to_string()))
+}
+
+/// Blocking XREAD of the `data` field after `cursor`.
+pub(crate) async fn read_stream_after(
+    connection: &mut redis::aio::MultiplexedConnection,
+    stream_key: &str,
+    cursor: &str,
+    read_block: Duration,
+) -> Result<RedisReadBatch, RedisIngestError> {
+    let block_ms: u64 = read_block.as_millis().try_into().unwrap_or(u64::MAX);
+    let reply: StreamReadReply = redis::cmd("XREAD")
+        .arg("COUNT")
+        .arg(256)
+        .arg("BLOCK")
+        .arg(block_ms)
+        .arg("STREAMS")
+        .arg(stream_key)
+        .arg(cursor)
+        .query_async(connection)
+        .await
+        .map_err(redis_error)?;
+    let mut next_cursor = cursor.to_string();
+    let mut messages = Vec::new();
+    for key in reply.keys {
+        for entry in key.ids {
+            next_cursor = entry.id.clone();
+            match entry.get::<String>(STREAM_FIELD) {
+                Some(message) => messages.push(message),
+                None => tracing::warn!(
+                    stream_id = %entry.id,
+                    field = STREAM_FIELD,
+                    "discarding Redis stream entry without state envelope"
+                ),
+            }
+        }
+    }
+    Ok(RedisReadBatch {
+        cursor: next_cursor,
+        messages,
+    })
+}
+
+pub(crate) fn redis_error(error: redis::RedisError) -> RedisIngestError {
     RedisIngestError::Connection(error.to_string())
 }
 
@@ -320,7 +345,7 @@ impl RedisIngestor {
     }
 }
 
-async fn wait_or_shutdown(
+pub(crate) async fn wait_or_shutdown(
     duration: Duration,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
 ) -> bool {

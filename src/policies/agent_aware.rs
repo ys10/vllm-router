@@ -3,11 +3,13 @@ use crate::config::AgentAwareConfig;
 use crate::core::Worker;
 use crate::metrics::RouterMetrics;
 use agent_router::{
-    maximal_balanced_subset, projected_server_load_ms, BalanceThresholds, FreshValue,
-    HbmDramScorer, HbmDramScorerConfig, MetricsScraper, RedisIngestConfig, RedisIngestor,
-    RequestOutcome, RequestScore, RequestScorer, ReqwestMetricsFetcher, ReservationLedger,
-    ReservationView, RolloutPercent, RoutingContext, ServerLoadState, SnapshotMetricsTargets,
-    SnapshotStore, StateProvider, WorkerRole, WorkerSnapshot,
+    maximal_balanced_subset, projected_server_load_ms, BalanceThresholds, ClusterSnapshot,
+    FreshValue, HbmDramScorer, HbmDramScorerConfig, MetricsScraper, RedisIngestConfig,
+    RedisIngestor, RequestOutcome, RequestScore, RequestScorer, ReqwestMetricsFetcher,
+    ReservationLedger, ReservationView, RolloutPercent, RouteHint, RouteHintAck,
+    RouteHintAckPublisher, RouteHintAcker, RouteHintIngestor, RouteHintOutcome,
+    RouteHintRedisConfig, RoutingContext, ServerLoadState, SnapshotMetricsTargets, SnapshotStore,
+    StateProvider, WorkerRole, WorkerSnapshot,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -15,9 +17,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{debug, warn};
 
+const ROUTE_HINT_ACK_QUEUE: usize = 1_024;
+
 #[derive(Debug)]
 struct ScoredCandidate {
     worker_key: String,
+    server_id: String,
     reservation_key: String,
     base_load_ms: f64,
     score: RequestScore,
@@ -82,6 +87,58 @@ impl RolloutCounters {
             state_fallback_attempts: self.state_fallback_attempts.load(Ordering::Relaxed),
         }
     }
+}
+
+/// Per-outcome counts of route-hint evaluation for attempts with a session.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AgentRouteHintStats {
+    pub applied: u64,
+    pub shadow_only: u64,
+    pub target_imbalanced: u64,
+    pub target_unavailable: u64,
+    pub expired: u64,
+    pub no_hint: u64,
+}
+
+#[derive(Debug, Default)]
+struct RouteHintCounters {
+    applied: AtomicU64,
+    shadow_only: AtomicU64,
+    target_imbalanced: AtomicU64,
+    target_unavailable: AtomicU64,
+    expired: AtomicU64,
+    no_hint: AtomicU64,
+}
+
+impl RouteHintCounters {
+    fn record(&self, outcome: RouteHintOutcome) {
+        let counter = match outcome {
+            RouteHintOutcome::Applied => &self.applied,
+            RouteHintOutcome::ShadowOnly => &self.shadow_only,
+            RouteHintOutcome::TargetImbalanced => &self.target_imbalanced,
+            RouteHintOutcome::TargetUnavailable => &self.target_unavailable,
+            RouteHintOutcome::Expired => &self.expired,
+            RouteHintOutcome::NoHint => &self.no_hint,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> AgentRouteHintStats {
+        AgentRouteHintStats {
+            applied: self.applied.load(Ordering::Relaxed),
+            shadow_only: self.shadow_only.load(Ordering::Relaxed),
+            target_imbalanced: self.target_imbalanced.load(Ordering::Relaxed),
+            target_unavailable: self.target_unavailable.load(Ordering::Relaxed),
+            expired: self.expired.load(Ordering::Relaxed),
+            no_hint: self.no_hint.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// A valid hint whose target maps to exactly one routable candidate.
+struct HintTarget {
+    hint: RouteHint,
+    candidate_index: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -170,6 +227,7 @@ struct RuntimeConfig {
 struct AgentRuntime {
     config: RuntimeConfig,
     store: Arc<SnapshotStore>,
+    route_hint_acks: Mutex<Option<tokio::sync::mpsc::Receiver<RouteHintAck>>>,
     started: AtomicBool,
     shutdown: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -228,6 +286,28 @@ impl AgentRuntime {
             let shutdown = shutdown_rx.clone();
             async move { metrics.run(metrics_interval, shutdown).await }
         });
+        let mut tasks = Vec::with_capacity(5);
+        if let Some(acks) = self
+            .route_hint_acks
+            .lock()
+            .expect("agent runtime poisoned")
+            .take()
+        {
+            let hint_config = RouteHintRedisConfig::production(
+                self.config.redis_url.clone(),
+                self.config.cluster_id.clone(),
+            );
+            let ingestor = RouteHintIngestor::new(hint_config.clone(), self.store.clone());
+            let publisher = RouteHintAckPublisher::new(hint_config);
+            tasks.push(tokio::spawn({
+                let shutdown = shutdown_rx.clone();
+                async move { ingestor.run(shutdown).await }
+            }));
+            tasks.push(tokio::spawn({
+                let shutdown = shutdown_rx.clone();
+                async move { publisher.run(acks, shutdown).await }
+            }));
+        }
         let expiry_store = self.store.clone();
         let expiry_interval = self.config.expiry_interval;
         let expiry_task =
@@ -236,11 +316,11 @@ impl AgentRuntime {
             );
 
         *self.shutdown.lock().expect("agent runtime poisoned") = Some(shutdown_tx);
-        self.tasks.lock().expect("agent runtime poisoned").extend([
-            redis_task,
-            metrics_task,
-            expiry_task,
-        ]);
+        tasks.extend([redis_task, metrics_task, expiry_task]);
+        self.tasks
+            .lock()
+            .expect("agent runtime poisoned")
+            .extend(tasks);
         Ok(())
     }
 }
@@ -263,6 +343,8 @@ pub struct AgentAwarePolicy {
     fallback_reservation_ms: f64,
     rollout: RolloutPercent,
     rollout_counters: RolloutCounters,
+    route_hint_acker: Option<Arc<RouteHintAcker>>,
+    route_hint_counters: RouteHintCounters,
     runtime: Option<AgentRuntime>,
 }
 
@@ -274,6 +356,7 @@ impl std::fmt::Debug for AgentAwarePolicy {
             .field("thresholds", &self.thresholds)
             .field("rollout_percent", &self.rollout.get())
             .field("rollout_stats", &self.rollout_counters.snapshot())
+            .field("route_hints_enabled", &self.route_hint_acker.is_some())
             .field(
                 "active_reservations",
                 &self.reservations.active_reservations(),
@@ -326,6 +409,16 @@ impl AgentAwarePolicy {
         };
         let store = Arc::new(SnapshotStore::default());
         let state: Arc<dyn StateProvider> = store.clone();
+        let (route_hint_acker, route_hint_acks) = if config.route_hints_enabled {
+            let (acker, receiver) = RouteHintAcker::new(
+                config.cluster_id.clone(),
+                format!("router-{}", uuid::Uuid::new_v4()),
+                ROUTE_HINT_ACK_QUEUE,
+            );
+            (Some(Arc::new(acker)), Some(receiver))
+        } else {
+            (None, None)
+        };
         let scorer = Arc::new(
             HbmDramScorer::new(config.cluster_secret.expose_secret(), scorer_config)
                 .map_err(|error| error.to_string())?,
@@ -340,6 +433,8 @@ impl AgentAwarePolicy {
             fallback_reservation_ms: config.fallback_reservation_ms as f64,
             rollout,
             rollout_counters: RolloutCounters::default(),
+            route_hint_acker,
+            route_hint_counters: RouteHintCounters::default(),
             runtime: Some(AgentRuntime {
                 config: RuntimeConfig {
                     redis_url: config.redis_url.expose_secret().to_string(),
@@ -352,6 +447,7 @@ impl AgentAwarePolicy {
                     expiry_interval: Duration::from_millis(config.expiry_interval_ms),
                 },
                 store,
+                route_hint_acks: Mutex::new(route_hint_acks),
                 started: AtomicBool::new(false),
                 shutdown: Mutex::new(None),
                 tasks: Mutex::new(Vec::new()),
@@ -432,8 +528,20 @@ impl AgentAwarePolicy {
             fallback_reservation_ms,
             rollout,
             rollout_counters: RolloutCounters::default(),
+            route_hint_acker: None,
+            route_hint_counters: RouteHintCounters::default(),
             runtime: None,
         })
+    }
+
+    /// Enable AgentRoute hints, acknowledging consumed hints through `acker`.
+    pub fn with_route_hint_acker(mut self, acker: Arc<RouteHintAcker>) -> Self {
+        self.route_hint_acker = Some(acker);
+        self
+    }
+
+    pub fn route_hint_stats(&self) -> AgentRouteHintStats {
+        self.route_hint_counters.snapshot()
     }
 
     pub fn start_background_tasks(&self) -> Result<(), String> {
@@ -453,12 +561,12 @@ impl AgentAwarePolicy {
 
     fn candidates_from_snapshot(
         &self,
+        snapshot: &ClusterSnapshot,
+        now: u64,
+        session_key: Option<&str>,
         workers: &[Arc<dyn Worker>],
         context: &RoutingContext,
     ) -> Option<Vec<ScoredCandidate>> {
-        let snapshot = self.state.snapshot();
-        let now = self.state.monotonic_ms();
-        let session_key = context.session_key(&self.cluster_secret).ok();
         let mut fresh_loads: HashMap<
             (String, u64),
             (&String, &WorkerSnapshot, &FreshValue<ServerLoadState>),
@@ -505,7 +613,7 @@ impl AgentAwarePolicy {
                 debug!(router_index, "agent-aware state incomplete; using baseline");
                 return None;
             };
-            let placement = session_key.as_ref().and_then(|session_key| {
+            let placement = session_key.and_then(|session_key| {
                 snapshot
                     .session_placements
                     .get(&format!("{session_key}:{worker_key}"))
@@ -522,6 +630,7 @@ impl AgentAwarePolicy {
             let score = self.scorer.score(context, &load.value, placement).ok()?;
             candidates.push(ScoredCandidate {
                 worker_key: worker_key.clone(),
+                server_id: load.value.server.server_id.clone(),
                 reservation_key: worker_reservation_key(worker.as_ref()),
                 base_load_ms,
                 score,
@@ -529,6 +638,35 @@ impl AgentAwarePolicy {
         }
 
         Some(candidates)
+    }
+
+    /// Resolve the session's hint to one candidate, or say why it cannot apply.
+    fn hint_target(
+        &self,
+        snapshot: &ClusterSnapshot,
+        now: u64,
+        session_key: Option<&str>,
+        candidates: Option<&Vec<ScoredCandidate>>,
+    ) -> Result<HintTarget, RouteHintOutcome> {
+        let hint = session_key
+            .and_then(|session_key| snapshot.route_hints.hints.get(session_key))
+            .ok_or(RouteHintOutcome::NoHint)?;
+        if !hint.is_valid(now) {
+            return Err(RouteHintOutcome::Expired);
+        }
+        let candidates = candidates.ok_or(RouteHintOutcome::TargetUnavailable)?;
+        let mut matching = candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| candidate.server_id == hint.preferred_server)
+            .map(|(index, _)| index);
+        match (matching.next(), matching.next()) {
+            (Some(candidate_index), None) => Ok(HintTarget {
+                hint: hint.clone(),
+                candidate_index,
+            }),
+            _ => Err(RouteHintOutcome::TargetUnavailable),
+        }
     }
 
     fn select_with_rollout(
@@ -540,18 +678,47 @@ impl AgentAwarePolicy {
             return None;
         }
         let baseline_index = self.fallback_cursor.fetch_add(1, Ordering::Relaxed) % workers.len();
-        let candidates = self.candidates_from_snapshot(workers, context);
+        let snapshot = self.state.snapshot();
+        let now = self.state.monotonic_ms();
+        let session_key = context.session_key(&self.cluster_secret).ok();
+        let candidates =
+            self.candidates_from_snapshot(&snapshot, now, session_key.as_deref(), workers, context);
+        let hint_target = match (&self.route_hint_acker, session_key.as_deref()) {
+            (Some(_), Some(session_key)) => {
+                Some(self.hint_target(&snapshot, now, Some(session_key), candidates.as_ref()))
+            }
+            _ => None,
+        };
+        let mut hint_outcome = None;
         let selected = self
             .reservations
             .choose_and_reserve(context.routing_id(), |reservations| {
-                let shadow_index = candidates.as_ref().and_then(|candidates| {
+                let shadow = candidates.as_ref().and_then(|candidates| {
                     select_shadow_candidate(candidates, reservations, self.thresholds)
                 });
+                let mut shadow_index = shadow.as_ref().map(|shadow| shadow.best);
+                if let Some(target) = &hint_target {
+                    hint_outcome = Some(match target {
+                        Ok(target)
+                            if shadow.as_ref().is_some_and(|shadow| {
+                                shadow.balanced.contains(&target.candidate_index)
+                            }) =>
+                        {
+                            shadow_index = Some(target.candidate_index);
+                            RouteHintOutcome::Applied
+                        }
+                        Ok(_) => RouteHintOutcome::TargetImbalanced,
+                        Err(outcome) => *outcome,
+                    });
+                }
                 let decision = SelectionDecision::new(
                     baseline_index,
                     shadow_index,
                     self.rollout.includes(context.routing_id()),
                 );
+                if hint_outcome == Some(RouteHintOutcome::Applied) && !decision.is_enforced() {
+                    hint_outcome = Some(RouteHintOutcome::ShadowOnly);
+                }
                 let selected_candidate = candidates
                     .as_ref()
                     .and_then(|candidates| candidates.get(decision.selected_index));
@@ -567,6 +734,9 @@ impl AgentAwarePolicy {
             });
         match selected {
             Ok(Some(decision)) => {
+                if let Some(outcome) = hint_outcome {
+                    self.observe_hint(outcome, hint_target.as_ref());
+                }
                 self.observe_decision(context, decision);
                 Some(decision.selected_index)
             }
@@ -575,6 +745,21 @@ impl AgentAwarePolicy {
                 warn!(error = %error, "agent-aware reservation failed");
                 None
             }
+        }
+    }
+
+    fn observe_hint(
+        &self,
+        outcome: RouteHintOutcome,
+        target: Option<&Result<HintTarget, RouteHintOutcome>>,
+    ) {
+        self.route_hint_counters.record(outcome);
+        RouterMetrics::record_agent_route_hint(outcome.label());
+        if outcome != RouteHintOutcome::Applied {
+            return;
+        }
+        if let (Some(acker), Some(Ok(target))) = (&self.route_hint_acker, target) {
+            acker.acknowledge(&target.hint, unix_now_ms());
         }
     }
 
@@ -644,11 +829,16 @@ fn normalize_endpoint(endpoint: &str) -> &str {
     endpoint.trim_end_matches('/')
 }
 
+struct ShadowSelection {
+    best: usize,
+    balanced: Vec<usize>,
+}
+
 fn select_shadow_candidate(
     candidates: &[ScoredCandidate],
     reservations: &ReservationView<'_>,
     thresholds: BalanceThresholds,
-) -> Option<usize> {
+) -> Option<ShadowSelection> {
     let projected_loads: Vec<f64> = candidates
         .iter()
         .map(|candidate| {
@@ -656,7 +846,7 @@ fn select_shadow_candidate(
         })
         .collect();
     let balanced = maximal_balanced_subset(&projected_loads, thresholds).ok()?;
-    let best = balanced.into_iter().min_by(|left, right| {
+    let best = balanced.iter().copied().min_by(|left, right| {
         candidates[*left]
             .score
             .estimated_service_ms
@@ -668,7 +858,15 @@ fn select_shadow_candidate(
                     .cmp(&candidates[*right].worker_key)
             })
     })?;
-    Some(best)
+    Some(ShadowSelection { best, balanced })
+}
+
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            elapsed.as_millis().try_into().unwrap_or(u64::MAX)
+        })
 }
 
 fn worker_reservation_key(worker: &dyn Worker) -> String {

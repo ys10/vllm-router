@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "message_type": "route_hint_ack",
+  "cluster_id": "prod-a",
+  "router_id": "router-3f0c2a",
+  "plan_id": "plan-17",
+  "session_key": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "state_version": 41,
+  "observed_at_ms": 1760000001234
+}

@@ -284,6 +284,9 @@ pub struct AgentAwareConfig {
     pub metrics_fresh_ms: u64,
     #[serde(default = "default_agent_expiry_interval_ms")]
     pub expiry_interval_ms: u64,
+    /// Consume AgentRoute route hints and acknowledge the versions used.
+    #[serde(default)]
+    pub route_hints_enabled: bool,
 }
 
 impl AgentAwareConfig {
@@ -308,6 +311,7 @@ impl AgentAwareConfig {
             metrics_timeout_ms: default_agent_metrics_timeout_ms(),
             metrics_fresh_ms: default_agent_metrics_fresh_ms(),
             expiry_interval_ms: default_agent_expiry_interval_ms(),
+            route_hints_enabled: false,
         }
     }
 }

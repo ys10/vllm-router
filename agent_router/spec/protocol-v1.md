@@ -226,3 +226,97 @@ the fresh load with the greatest `(observed_at_ms, seq)`. If any routable worker
 still has missing, stale, or mismatched Redis load state, the complete candidate
 set uses round-robin fallback. It never blocks request forwarding and never
 interprets missing state as zero load.
+
+## AgentRoute route hints
+
+AgentRoute (the global KV control plane in AgentInfer) publishes versioned
+route hints after it has verified that a session's KV prefix is READY on a
+target worker. Hints are an additional, optional input to the agent-aware
+policy; without them routing behaves exactly as described above.
+
+### Redis layout
+
+```text
+agentinfer:agent-route:v1:{cluster_id}:route-hints        # latest document, SET PX
+agentinfer:agent-route:v1:{cluster_id}:route-hint-events  # XADD data <document>
+agentinfer:agent-route:v1:{cluster_id}:route-hint-acks    # XADD data <ack>
+```
+
+The document conforms to `route-hints-v1.schema.json`:
+
+```json
+{
+  "schema_version": 1,
+  "message_type": "route_hints",
+  "cluster_id": "...",
+  "state_version": 42,
+  "generated_at_ms": 1760000000000,
+  "hints": [
+    {
+      "session_key": "<Router v1 session key>",
+      "source_server": "<server_id or null>",
+      "preferred_server": "<server_id>",
+      "plan_id": "...",
+      "state": "ready",
+      "valid_until_ms": 1760000005000,
+      "state_version": 41
+    }
+  ]
+}
+```
+
+`session_key` is the same 64-hex keyed session identity the Router derives for
+session placement. `preferred_server` is a Router v1 `server_id`.
+
+### Ingestion
+
+A document replaces every previously ingested hint when, and only when, its
+`state_version` is greater than the last accepted one; an empty `hints` array
+therefore revokes all hints. Older or equal versions are ignored. Only `ready`
+and `active` hints are retained. Bootstrap reads the latest snapshot key before
+consuming the event stream with a Router-local cursor, mirroring Router v1
+state.
+
+`valid_until_ms` is a producer wall-clock deadline. At ingestion the Router
+converts the remaining validity, reduced by the 2-second clock-skew allowance,
+into a monotonic deadline. Expired hints are never used.
+
+### Routing
+
+Hints never bypass the safety rules above. For a request whose session key has
+a valid hint, the agent-aware policy uses the hint target instead of the scored
+shadow choice only if all hold:
+
+1. agent-aware state is complete for the candidate set;
+2. exactly one candidate has a fresh load whose identity has
+   `server_id == preferred_server`;
+3. that candidate belongs to the maximal balanced subset;
+4. the request is in the enforced rollout cohort.
+
+Otherwise the normal decision is used and the hint outcome is recorded as one
+of `no_hint`, `expired`, `target_unavailable`, `target_imbalanced`, or
+`shadow_only`. A hint is never a reason to fall back to the baseline.
+
+### Acknowledgement
+
+When a request is actually forwarded to the hint target, the Router emits one
+acknowledgement per `(plan_id, session_key, state_version)`:
+
+```json
+{
+  "schema_version": 1,
+  "message_type": "route_hint_ack",
+  "cluster_id": "...",
+  "router_id": "<process-unique id>",
+  "plan_id": "...",
+  "session_key": "...",
+  "state_version": 41,
+  "observed_at_ms": 1760000001234
+}
+```
+
+`state_version` is the hint's own version, so AgentRoute can reject an
+acknowledgement for a superseded hint. Acknowledgements leave the selection
+path through a bounded in-memory queue drained by a background task; when the
+queue is full the acknowledgement is dropped and counted, never awaited.
+AgentRoute promotes a READY hint to ACTIVE only after such an acknowledgement.

@@ -138,6 +138,10 @@ struct CliArgs {
     #[arg(long, default_value_t = 0)]
     agent_rollout_percent: u8,
 
+    /// Consume AgentRoute route hints from Redis and acknowledge the versions used
+    #[arg(long, default_value_t = false)]
+    agent_route_hints: bool,
+
     /// Enable vLLM PD (Prefill-Decode) disaggregated mode with vLLM-specific two-stage processing
     #[arg(long, default_value_t = false)]
     vllm_pd_disaggregation: bool,
@@ -430,6 +434,7 @@ impl CliArgs {
                 config.balance_rel_threshold = self.agent_balance_rel_threshold;
                 config.dram_block_restore_ms = self.agent_dram_block_restore_ms;
                 config.rollout_percent = self.agent_rollout_percent;
+                config.route_hints_enabled = self.agent_route_hints;
                 PolicyConfig::AgentAware {
                     config: Box::new(config),
                 }
