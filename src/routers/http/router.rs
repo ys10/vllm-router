@@ -61,7 +61,7 @@ fn insert_router_xarg(
     }
 }
 
-fn agent_router_request_json<T: serde::Serialize>(
+pub(crate) fn agent_router_request_json<T: serde::Serialize>(
     request: &T,
     context: &RoutingContext,
 ) -> Result<serde_json::Value, String> {

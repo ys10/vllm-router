@@ -474,23 +474,27 @@ impl ConfigValidator {
 
     /// Validate compatibility between different configuration sections
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
-        let has_agent_aware = matches!(&config.policy, PolicyConfig::AgentAware { .. })
-            || match &config.mode {
-                RoutingMode::VllmPrefillDecode {
-                    prefill_policy,
-                    decode_policy,
-                    ..
-                } => {
-                    matches!(prefill_policy, Some(PolicyConfig::AgentAware { .. }))
-                        || matches!(decode_policy, Some(PolicyConfig::AgentAware { .. }))
+        let is_agent_aware =
+            |policy: &PolicyConfig| matches!(policy, PolicyConfig::AgentAware { .. });
+        match &config.mode {
+            RoutingMode::Regular { .. } => {}
+            RoutingMode::VllmPrefillDecode { decode_policy, .. } => {
+                // Agent-aware chooses the Prefill worker; decode keeps its own policy.
+                if is_agent_aware(decode_policy.as_ref().unwrap_or(&config.policy)) {
+                    return Err(ConfigError::IncompatibleConfig {
+                        reason: "Agent-aware policy can route vLLM PD prefill only; set a non-agent-aware --decode-policy"
+                            .to_string(),
+                    });
                 }
-                _ => false,
-            };
-        if has_agent_aware && !matches!(&config.mode, RoutingMode::Regular { .. }) {
-            return Err(ConfigError::IncompatibleConfig {
-                reason: "Agent-aware policy currently supports regular HTTP routing only"
-                    .to_string(),
-            });
+            }
+            _ => {
+                if is_agent_aware(&config.policy) {
+                    return Err(ConfigError::IncompatibleConfig {
+                        reason: "Agent-aware policy supports regular and vLLM PD routing only"
+                            .to_string(),
+                    });
+                }
+            }
         }
 
         // IGW mode is independent - skip other compatibility checks when enabled

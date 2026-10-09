@@ -9,8 +9,10 @@ use crate::config::KvConnector;
 use crate::core::{BasicWorker, Worker, WorkerType};
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
-use crate::policies::PolicyRegistry;
+use crate::policies::{PolicyRegistry, RequestLifecycle};
+use crate::protocols::spec::GenerationRequest;
 use crate::routers::{header_utils, RouterTrait, WorkerManagement};
+use agent_router::RequestOutcome;
 use async_trait::async_trait;
 use axum::{
     body::Body,
@@ -1120,6 +1122,7 @@ impl VllmPDRouter {
         original_request: Value,
         prefill_worker: Arc<dyn Worker>,
         decode_worker: Arc<dyn Worker>,
+        mut prefill_lifecycle: Option<RequestLifecycle>,
         path: &str,
         headers: Option<&HeaderMap>,
     ) -> Result<Response, PDRouterError> {
@@ -1301,7 +1304,12 @@ impl VllmPDRouter {
         // Stop profiling on prefill server after its work is done
         self.stop_profiling(&prefill_base_url).await;
 
-        // Prefill phase complete: decrement prefill load, increment decode load
+        // Prefill phase complete: decrement prefill load, increment decode load.
+        // The prefill policy's reservation covers prefill work only; an early
+        // return drops the lifecycle, which releases it as cancelled.
+        if let Some(mut lifecycle) = prefill_lifecycle.take() {
+            lifecycle.finish(RequestOutcome::Succeeded);
+        }
         prefill_worker.decrement_load();
         decode_worker.increment_load();
 
@@ -1777,7 +1785,7 @@ impl RouterTrait for VllmPDRouter {
         &self,
         headers: Option<&HeaderMap>,
         body: &crate::protocols::spec::ChatCompletionRequest,
-        _model_id: Option<&str>,
+        model_id: Option<&str>,
     ) -> Response {
         info!(
             "vLLM route_chat called, use_discovery={}",
@@ -1814,22 +1822,14 @@ impl RouterTrait for VllmPDRouter {
             info!("Using direct URL mode with VllmPDRouter's own routing logic");
 
             // Convert request to JSON
-            let request_json = match serde_json::to_value(body) {
-                Ok(json) => {
-                    debug!(
-                        "Serialized chat request: {}",
-                        serde_json::to_string_pretty(&json).unwrap_or_default()
-                    );
-                    json
-                }
-                Err(e) => {
-                    return (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Serialization error: {}", e),
-                    )
-                        .into_response()
-                }
-            };
+            let context = Arc::new(body.routing_context("/v1/chat/completions", model_id));
+            let request_json =
+                match crate::routers::http::router::agent_router_request_json(body, &context) {
+                    Ok(json) => json,
+                    Err(e) => {
+                        return (axum::http::StatusCode::BAD_REQUEST, e).into_response();
+                    }
+                };
 
             // Get prefill and decode workers from worker_registry
             let prefill_workers = self.pd_router.worker_registry.get_prefill_workers();
@@ -1871,9 +1871,9 @@ impl RouterTrait for VllmPDRouter {
             let prefill_policy = self.policy_registry.get_prefill_policy();
             let decode_policy = self.policy_registry.get_decode_policy();
 
-            let prefill_idx = match prefill_policy.select_worker_with_headers(
+            let prefill_idx = match prefill_policy.select_worker_with_context(
                 &prefill_workers,
-                request_str,
+                &context,
                 request_headers.as_ref(),
             ) {
                 Some(idx) => idx,
@@ -1922,6 +1922,11 @@ impl RouterTrait for VllmPDRouter {
                     request_json,
                     prefill_worker.clone(),
                     decode_worker.clone(),
+                    Some(RequestLifecycle::start(
+                        prefill_policy.clone(),
+                        prefill_worker.clone(),
+                        context.clone(),
+                    )),
                     "/v1/chat/completions",
                     headers,
                 )
@@ -1948,7 +1953,7 @@ impl RouterTrait for VllmPDRouter {
         &self,
         headers: Option<&HeaderMap>,
         body: &crate::protocols::spec::CompletionRequest,
-        _model_id: Option<&str>,
+        model_id: Option<&str>,
     ) -> Response {
         info!(
             "vLLM route_completion called, use_discovery={}",
@@ -1985,22 +1990,14 @@ impl RouterTrait for VllmPDRouter {
             info!("Using direct URL mode with VllmPDRouter's own routing logic");
 
             // Convert request to JSON
-            let request_json = match serde_json::to_value(body) {
-                Ok(json) => {
-                    debug!(
-                        "Serialized completion request: {}",
-                        serde_json::to_string_pretty(&json).unwrap_or_default()
-                    );
-                    json
-                }
-                Err(e) => {
-                    return (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Serialization error: {}", e),
-                    )
-                        .into_response()
-                }
-            };
+            let context = Arc::new(body.routing_context("/v1/completions", model_id));
+            let request_json =
+                match crate::routers::http::router::agent_router_request_json(body, &context) {
+                    Ok(json) => json,
+                    Err(e) => {
+                        return (axum::http::StatusCode::BAD_REQUEST, e).into_response();
+                    }
+                };
 
             // Get prefill and decode workers from worker_registry
             let prefill_workers = self.pd_router.worker_registry.get_prefill_workers();
@@ -2042,9 +2039,9 @@ impl RouterTrait for VllmPDRouter {
             let prefill_policy = self.policy_registry.get_prefill_policy();
             let decode_policy = self.policy_registry.get_decode_policy();
 
-            let prefill_idx = match prefill_policy.select_worker_with_headers(
+            let prefill_idx = match prefill_policy.select_worker_with_context(
                 &prefill_workers,
-                request_str,
+                &context,
                 request_headers.as_ref(),
             ) {
                 Some(idx) => idx,
@@ -2093,6 +2090,11 @@ impl RouterTrait for VllmPDRouter {
                     request_json,
                     prefill_worker.clone(),
                     decode_worker.clone(),
+                    Some(RequestLifecycle::start(
+                        prefill_policy.clone(),
+                        prefill_worker.clone(),
+                        context.clone(),
+                    )),
                     "/v1/completions",
                     headers,
                 )
@@ -2311,6 +2313,7 @@ impl RouterTrait for VllmPDRouter {
                     request_json,
                     prefill_worker.clone(),
                     decode_worker.clone(),
+                    None,
                     path,
                     headers,
                 )

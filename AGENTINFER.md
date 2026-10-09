@@ -13,6 +13,10 @@ binding) the agent-aware policy also consumes AgentRoute route hints and
 acknowledges the exact hint versions it forwards to; see "AgentRoute route
 hints" in `agent_router/spec/protocol-v1.md`. Hints are off by default.
 
+In vLLM PD mode, `--prefill-policy agent_aware` routes prefill workers
+(published with role `prefill`) through the same scoring, reservations and
+hints; the decode policy must not be agent-aware.
+
 Run the complete Rust verification with:
 
 ```bash

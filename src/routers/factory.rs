@@ -67,14 +67,16 @@ impl RouterFactory {
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
         // Initialize policies in PolicyRegistry - use specific policies if provided, otherwise fall back to main policy
-        let prefill_policy =
-            PolicyFactory::create_from_config(prefill_policy_config.unwrap_or(main_policy_config));
+        let prefill_policy = PolicyFactory::create_prefill_from_config(
+            prefill_policy_config.unwrap_or(main_policy_config),
+        );
         let decode_policy =
             PolicyFactory::create_from_config(decode_policy_config.unwrap_or(main_policy_config));
 
         // Set the prefill and decode policies in the registry
         ctx.policy_registry.set_prefill_policy(prefill_policy);
         ctx.policy_registry.set_decode_policy(decode_policy);
+        ctx.policy_registry.start_background_tasks()?;
 
         // Create vLLM PD router with both static URLs and service discovery support
         if discovery_address.is_some() {

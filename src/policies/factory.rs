@@ -12,6 +12,22 @@ pub struct PolicyFactory;
 
 impl PolicyFactory {
     /// Create a policy from configuration
+    /// Prefill policy for PD routing: agent-aware scores Prefill-role workers.
+    pub fn create_prefill_from_config(config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
+        if let PolicyConfig::AgentAware { config } = config {
+            match AgentAwarePolicy::from_config(config) {
+                Ok(policy) => {
+                    return Arc::new(policy.with_candidate_role(agent_router::WorkerRole::Prefill))
+                }
+                Err(error) => {
+                    tracing::error!(error = %error, "invalid prefill agent-aware policy; using round-robin");
+                    return Arc::new(RoundRobinPolicy::new());
+                }
+            }
+        }
+        Self::create_from_config(config)
+    }
+
     pub fn create_from_config(config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
         match config {
             PolicyConfig::Random => Arc::new(RandomPolicy::new()),

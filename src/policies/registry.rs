@@ -218,12 +218,13 @@ impl PolicyRegistry {
     }
 
     pub fn start_background_tasks(&self) -> Result<(), String> {
-        if let Some(policy) = self
-            .default_policy
-            .as_any()
-            .downcast_ref::<AgentAwarePolicy>()
-        {
-            policy.start_background_tasks()?;
+        let mut policies = vec![self.default_policy.clone()];
+        policies.extend(self.prefill_policy.read().unwrap().clone());
+        policies.extend(self.decode_policy.read().unwrap().clone());
+        for policy in policies {
+            if let Some(policy) = policy.as_any().downcast_ref::<AgentAwarePolicy>() {
+                policy.start_background_tasks()?;
+            }
         }
         Ok(())
     }

@@ -172,8 +172,14 @@ actually receive the attempt is reserved; a shadow recommendation never creates
 a second reservation. Counters and Prometheus metrics count attempts, with
 action (`baseline` or `enforced`) and shadow comparison (`agreement`,
 `disagreement`, or `unavailable`). Promotion proceeds through shadow, 1, 5, 25,
-and 100 percent after observing each stage. PD Router rollout is not part of
-this protocol version.
+and 100 percent after observing each stage.
+
+In vLLM PD mode (`--vllm-pd-disaggregation`) the agent-aware policy may be the
+prefill policy only. It scores workers whose identity role is `prefill`, uses
+the same session placements, reservations and route hints, and its
+reservation covers the prefill phase: it is released when the prefill response
+returns (or the attempt is dropped). Decode keeps its own non-agent-aware
+policy. Requests forwarded to both workers carry the canonical `vllm_xargs`.
 
 ## Projected load, scoring, and reservations
 

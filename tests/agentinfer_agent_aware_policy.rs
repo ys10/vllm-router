@@ -821,3 +821,39 @@ fn hints_are_ignored_unless_enabled() {
     assert_eq!(route(&harness.policy, &context), unhinted);
     assert_eq!(harness.policy.route_hint_stats(), Default::default());
 }
+
+fn as_prefill(mut snapshot: ClusterSnapshot) -> ClusterSnapshot {
+    for worker in snapshot.workers.values_mut() {
+        if let Some(identity) = worker.identity.as_mut() {
+            identity.role = WorkerRole::Prefill;
+        }
+        if let Some(load) = worker.load.as_mut() {
+            load.value.server.role = WorkerRole::Prefill;
+        }
+    }
+    snapshot
+}
+
+#[test]
+fn prefill_role_policy_scores_prefill_workers_and_applies_hints() {
+    let full = RolloutPercent::new(100).unwrap();
+    let context = session_context(full, true);
+    let unhinted = unhinted_choice(full, &context);
+    let snapshot = as_prefill(with_hint(
+        snapshot_with_loads(0, 0),
+        &context,
+        SERVERS[1 - unhinted],
+        5_000,
+    ));
+    let mut harness = hint_policy(snapshot.clone(), full, true);
+    harness.policy = harness.policy.with_candidate_role(WorkerRole::Prefill);
+
+    assert_eq!(route(&harness.policy, &context), 1 - unhinted);
+    assert_eq!(harness.policy.route_hint_stats().applied, 1);
+    assert!(harness.acks.try_recv().is_ok());
+
+    // A Unified-role policy sees no candidates among Prefill workers.
+    let unified = hint_policy(snapshot, full, true);
+    route(&unified.policy, &context);
+    assert_eq!(unified.policy.route_hint_stats().target_unavailable, 1);
+}

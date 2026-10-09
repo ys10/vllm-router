@@ -71,7 +71,52 @@ fn agent_policy_is_rejected_outside_regular_http_mode() {
     );
 
     let error = config.validate().unwrap_err().to_string();
-    assert!(error.contains("regular HTTP routing only"));
+    assert!(error.contains("regular and vLLM PD routing only"));
+}
+
+fn vllm_pd(prefill: Option<PolicyConfig>, decode: Option<PolicyConfig>) -> RoutingMode {
+    RoutingMode::VllmPrefillDecode {
+        prefill_urls: vec![
+            ("http://127.0.0.1:8100".to_string(), None),
+            ("http://127.0.0.1:8101".to_string(), None),
+        ],
+        decode_urls: vec!["http://127.0.0.1:8200".to_string()],
+        prefill_policy: prefill,
+        decode_policy: decode,
+        discovery_address: None,
+    }
+}
+
+fn agent_policy() -> PolicyConfig {
+    PolicyConfig::AgentAware {
+        config: Box::new(AgentAwareConfig::production(
+            "redis://127.0.0.1:6379",
+            "cluster-a",
+            "cluster-secret-value",
+        )),
+    }
+}
+
+#[test]
+fn agent_policy_may_choose_the_vllm_pd_prefill_worker() {
+    let config = RouterConfig::new(
+        vllm_pd(Some(agent_policy()), Some(PolicyConfig::RoundRobin)),
+        PolicyConfig::RoundRobin,
+    );
+
+    config.validate().unwrap();
+}
+
+#[test]
+fn agent_policy_is_rejected_for_vllm_pd_decode_selection() {
+    for (decode, main) in [
+        (Some(agent_policy()), PolicyConfig::RoundRobin),
+        (None, agent_policy()),
+    ] {
+        let config = RouterConfig::new(vllm_pd(Some(agent_policy()), decode), main);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("PD prefill only"), "{error}");
+    }
 }
 
 #[test]

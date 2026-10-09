@@ -345,6 +345,7 @@ pub struct AgentAwarePolicy {
     rollout_counters: RolloutCounters,
     route_hint_acker: Option<Arc<RouteHintAcker>>,
     route_hint_counters: RouteHintCounters,
+    candidate_role: WorkerRole,
     runtime: Option<AgentRuntime>,
 }
 
@@ -357,6 +358,7 @@ impl std::fmt::Debug for AgentAwarePolicy {
             .field("rollout_percent", &self.rollout.get())
             .field("rollout_stats", &self.rollout_counters.snapshot())
             .field("route_hints_enabled", &self.route_hint_acker.is_some())
+            .field("candidate_role", &self.candidate_role)
             .field(
                 "active_reservations",
                 &self.reservations.active_reservations(),
@@ -435,6 +437,7 @@ impl AgentAwarePolicy {
             rollout_counters: RolloutCounters::default(),
             route_hint_acker,
             route_hint_counters: RouteHintCounters::default(),
+            candidate_role: WorkerRole::Unified,
             runtime: Some(AgentRuntime {
                 config: RuntimeConfig {
                     redis_url: config.redis_url.expose_secret().to_string(),
@@ -530,8 +533,15 @@ impl AgentAwarePolicy {
             rollout_counters: RolloutCounters::default(),
             route_hint_acker: None,
             route_hint_counters: RouteHintCounters::default(),
+            candidate_role: WorkerRole::Unified,
             runtime: None,
         })
+    }
+
+    /// Score only workers that publish this role, e.g. Prefill for PD routing.
+    pub fn with_candidate_role(mut self, role: WorkerRole) -> Self {
+        self.candidate_role = role;
+        self
     }
 
     /// Enable AgentRoute hints, acknowledging consumed hints through `acker`.
@@ -579,7 +589,7 @@ impl AgentAwarePolicy {
                 continue;
             };
             if !load.is_fresh(now)
-                || identity.role != WorkerRole::Unified
+                || identity.role != self.candidate_role
                 || context
                     .model_id
                     .as_deref()

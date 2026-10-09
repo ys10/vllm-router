@@ -155,8 +155,8 @@ struct CliArgs {
     #[arg(long, action = ArgAction::Append)]
     decode: Vec<String>,
 
-    /// Specific policy for prefill nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
+    /// Specific policy for prefill nodes in PD mode (agent_aware: vLLM PD only)
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash", "agent_aware"])]
     prefill_policy: Option<String>,
 
     /// Specific policy for decode nodes in PD mode
