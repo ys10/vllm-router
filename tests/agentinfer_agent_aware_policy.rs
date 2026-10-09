@@ -686,6 +686,7 @@ fn with_hint(
     snapshot.route_hints.hints.insert(
         session_key.clone(),
         RouteHint {
+            producer_id: "apc-test".to_string(),
             session_key,
             source_server: Some("server-a".to_string()),
             preferred_server: preferred_server.to_string(),

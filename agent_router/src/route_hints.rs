@@ -85,6 +85,8 @@ impl RouteHintsDocument {
 /// A routable hint retained by the Router, valid until a monotonic deadline.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouteHint {
+    /// Producer whose version sequence `state_version` belongs to.
+    pub producer_id: String,
     pub session_key: String,
     pub source_server: Option<String>,
     pub preferred_server: String,
@@ -141,6 +143,7 @@ impl RouteHintSet {
                 continue;
             }
             let hint = RouteHint {
+                producer_id: document.producer_id.clone(),
                 session_key: payload.session_key.clone(),
                 source_server: payload.source_server.clone(),
                 preferred_server: payload.preferred_server.clone(),
@@ -215,7 +218,7 @@ pub struct RouteHintAcker {
     cluster_id: String,
     router_id: String,
     sender: tokio::sync::mpsc::Sender<RouteHintAck>,
-    acknowledged: Mutex<HashMap<(String, String), u64>>,
+    acknowledged: Mutex<HashMap<(String, String, String), u64>>,
     dropped: AtomicU64,
 }
 
@@ -243,7 +246,12 @@ impl RouteHintAcker {
 
     /// Enqueue one acknowledgement per exact hint version; never blocks.
     pub fn acknowledge(&self, hint: &RouteHint, observed_at_ms: u64) -> bool {
-        let key = (hint.plan_id.clone(), hint.session_key.clone());
+        // Versions restart with a new producer, so dedupe within one producer.
+        let key = (
+            hint.producer_id.clone(),
+            hint.plan_id.clone(),
+            hint.session_key.clone(),
+        );
         {
             let mut acknowledged = self.acknowledged.lock().expect("acker poisoned");
             if acknowledged
