@@ -3,13 +3,12 @@ use crate::config::AgentAwareConfig;
 use crate::core::Worker;
 use crate::metrics::RouterMetrics;
 use agent_router::{
-    maximal_balanced_subset, projected_server_load_ms, BalanceThresholds, ClusterSnapshot,
-    FreshValue, HbmDramScorer, HbmDramScorerConfig, MetricsScraper, RedisIngestConfig,
-    RedisIngestor, RequestOutcome, RequestScore, RequestScorer, ReqwestMetricsFetcher,
-    ReservationLedger, ReservationView, RolloutPercent, RouteHint, RouteHintAck,
-    RouteHintAckPublisher, RouteHintAcker, RouteHintIngestor, RouteHintOutcome,
-    RouteHintRedisConfig, RoutingContext, ServerLoadState, SnapshotMetricsTargets, SnapshotStore,
-    StateProvider, WorkerRole, WorkerSnapshot,
+    projected_server_load_ms, BalanceThresholds, ClusterSnapshot, FreshValue, HbmDramScorer,
+    HbmDramScorerConfig, MetricsScraper, RedisIngestConfig, RedisIngestor, RequestOutcome,
+    RequestScore, RequestScorer, ReqwestMetricsFetcher, ReservationLedger, ReservationView,
+    RolloutPercent, RouteHint, RouteHintAck, RouteHintAckPublisher, RouteHintAcker,
+    RouteHintIngestor, RouteHintOutcome, RouteHintRedisConfig, RoutingContext, ServerLoadState,
+    SnapshotMetricsTargets, SnapshotStore, StateProvider, WorkerRole, WorkerSnapshot,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -337,7 +336,6 @@ pub struct AgentAwarePolicy {
     state: Arc<dyn StateProvider>,
     scorer: Arc<dyn RequestScorer>,
     cluster_secret: Vec<u8>,
-    thresholds: BalanceThresholds,
     reservations: Arc<ReservationLedger>,
     fallback_cursor: AtomicUsize,
     fallback_reservation_ms: f64,
@@ -354,7 +352,6 @@ impl std::fmt::Debug for AgentAwarePolicy {
         formatter
             .debug_struct("AgentAwarePolicy")
             .field("cluster_secret", &"<redacted>")
-            .field("thresholds", &self.thresholds)
             .field("rollout_percent", &self.rollout.get())
             .field("rollout_stats", &self.rollout_counters.snapshot())
             .field("route_hints_enabled", &self.route_hint_acker.is_some())
@@ -396,7 +393,9 @@ impl AgentAwarePolicy {
         {
             return Err("agent-aware reservation and runtime intervals must be positive".into());
         }
-        let thresholds = BalanceThresholds::new(
+        // Still validated so existing configs keep their meaning-free contract, but
+        // selection no longer uses fixed balance bands (see `select_shadow_candidate`).
+        BalanceThresholds::new(
             config.balance_abs_threshold_ms,
             config.balance_rel_threshold,
         )
@@ -429,7 +428,6 @@ impl AgentAwarePolicy {
             state,
             scorer,
             cluster_secret: config.cluster_secret.expose_secret().as_bytes().to_vec(),
-            thresholds,
             reservations: Arc::new(ReservationLedger::default()),
             fallback_cursor: AtomicUsize::new(0),
             fallback_reservation_ms: config.fallback_reservation_ms as f64,
@@ -525,7 +523,6 @@ impl AgentAwarePolicy {
             state,
             scorer,
             cluster_secret: cluster_secret.to_vec(),
-            thresholds,
             reservations: Arc::new(ReservationLedger::default()),
             fallback_cursor: AtomicUsize::new(0),
             fallback_reservation_ms,
@@ -700,20 +697,30 @@ impl AgentAwarePolicy {
             _ => None,
         };
         let mut hint_outcome = None;
+        let kv = candidates.as_ref().map(|candidates| {
+            // Hints only name KV holders when this Router consumes hints at all.
+            let hinted_session = session_key
+                .as_deref()
+                .filter(|_| self.route_hint_acker.is_some());
+            kv_holders(candidates, &snapshot, now, hinted_session)
+        });
+        let hinted_index = hint_target
+            .as_ref()
+            .and_then(|target| target.as_ref().ok())
+            .map(|target| target.candidate_index);
         let selected = self
             .reservations
             .choose_and_reserve(context.routing_id(), |reservations| {
-                let shadow = candidates.as_ref().and_then(|candidates| {
-                    select_shadow_candidate(candidates, reservations, self.thresholds)
-                });
-                let mut shadow_index = shadow.as_ref().map(|shadow| shadow.best);
+                let shadow = candidates
+                    .as_ref()
+                    .zip(kv.as_ref())
+                    .and_then(|(candidates, kv)| {
+                        select_shadow_candidate(candidates, reservations, kv, hinted_index)
+                    });
+                let mut shadow_index = shadow;
                 if let Some(target) = &hint_target {
                     hint_outcome = Some(match target {
-                        Ok(target)
-                            if shadow.as_ref().is_some_and(|shadow| {
-                                shadow.balanced.contains(&target.candidate_index)
-                            }) =>
-                        {
+                        Ok(target) if shadow == Some(target.candidate_index) => {
                             shadow_index = Some(target.candidate_index);
                             RouteHintOutcome::Applied
                         }
@@ -736,10 +743,11 @@ impl AgentAwarePolicy {
                     || worker_reservation_key(workers[decision.selected_index].as_ref()),
                     |candidate| candidate.reservation_key.clone(),
                 );
-                let reservation_ms = selected_candidate
-                    .map_or(self.fallback_reservation_ms, |candidate| {
-                        candidate.score.estimated_service_ms
-                    });
+                let reservation_ms = match (selected_candidate, kv.as_ref()) {
+                    (Some(_), Some(kv)) => kv.own_work_ms[decision.selected_index],
+                    (Some(candidate), None) => candidate.score.estimated_service_ms,
+                    (None, _) => self.fallback_reservation_ms,
+                };
                 Some((decision, reservation_key, reservation_ms))
             });
         match selected {
@@ -839,36 +847,96 @@ fn normalize_endpoint(endpoint: &str) -> &str {
     endpoint.trim_end_matches('/')
 }
 
-struct ShadowSelection {
-    best: usize,
-    balanced: Vec<usize>,
+/// Which candidates already hold the session's KV, and each candidate's own work.
+struct KvHolders {
+    /// Candidate indices holding the session's KV: a compatible placement, or the
+    /// source/target of a valid Route Hint (a READY target received the KV by
+    /// migration; the source keeps it until copy-before-evict cleanup).
+    holders: Vec<usize>,
+    /// This request's service estimate per candidate. A hint source or target
+    /// without its own placement report is charged the holder's (reused) work.
+    own_work_ms: Vec<f64>,
 }
 
+fn kv_holders(
+    candidates: &[ScoredCandidate],
+    snapshot: &ClusterSnapshot,
+    now: u64,
+    hinted_session: Option<&str>,
+) -> KvHolders {
+    let mut own_work_ms: Vec<f64> = candidates
+        .iter()
+        .map(|candidate| candidate.score.estimated_service_ms)
+        .collect();
+    let mut holders: Vec<usize> = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| {
+            candidate.score.hbm_reused_tokens > 0 || candidate.score.dram_reused_tokens > 0
+        })
+        .map(|(index, _)| index)
+        .collect();
+    let reused_work_ms = holders
+        .iter()
+        .map(|index| own_work_ms[*index])
+        .reduce(f64::min);
+    if let Some(hint) = hinted_session
+        .and_then(|session_key| snapshot.route_hints.hints.get(session_key))
+        .filter(|hint| hint.is_valid(now))
+    {
+        for (index, candidate) in candidates.iter().enumerate() {
+            let named = candidate.server_id == hint.preferred_server
+                || hint.source_server.as_deref() == Some(candidate.server_id.as_str());
+            if named && !holders.contains(&index) {
+                holders.push(index);
+                if let Some(reused) = reused_work_ms {
+                    own_work_ms[index] = own_work_ms[index].min(reused);
+                }
+            }
+        }
+    }
+    KvHolders {
+        holders,
+        own_work_ms,
+    }
+}
+
+/// Pick the candidate with the earliest estimated completion: projected queue
+/// (reported load plus this Router's in-flight reservations) plus this request's
+/// own work there. There are no fixed balance bands; every term is measured.
+///
+/// A session whose KV is cached somewhere only chooses among the KV holders, so
+/// the Router never recomputes a prefix just to rebalance load; moving a session
+/// is AgentRoute's job, after its KV has been migrated. Requests without cached
+/// KV choose among all candidates, i.e. the least-loaded one.
 fn select_shadow_candidate(
     candidates: &[ScoredCandidate],
     reservations: &ReservationView<'_>,
-    thresholds: BalanceThresholds,
-) -> Option<ShadowSelection> {
-    let projected_loads: Vec<f64> = candidates
-        .iter()
-        .map(|candidate| {
-            candidate.base_load_ms + reservations.reserved_ms(&candidate.reservation_key)
-        })
-        .collect();
-    let balanced = maximal_balanced_subset(&projected_loads, thresholds).ok()?;
-    let best = balanced.iter().copied().min_by(|left, right| {
-        candidates[*left]
-            .score
-            .estimated_service_ms
-            .total_cmp(&candidates[*right].score.estimated_service_ms)
-            .then_with(|| projected_loads[*left].total_cmp(&projected_loads[*right]))
+    kv: &KvHolders,
+    hinted_index: Option<usize>,
+) -> Option<usize> {
+    let all: Vec<usize> = (0..candidates.len()).collect();
+    let pool = if kv.holders.is_empty() {
+        &all
+    } else {
+        &kv.holders
+    };
+    let queue_ms = |index: usize| {
+        candidates[index].base_load_ms
+            + reservations.reserved_ms(&candidates[index].reservation_key)
+    };
+    pool.iter().copied().min_by(|left, right| {
+        let completion = |index: usize| queue_ms(index) + kv.own_work_ms[index];
+        completion(*left)
+            .total_cmp(&completion(*right))
+            .then_with(|| (hinted_index != Some(*left)).cmp(&(hinted_index != Some(*right))))
+            .then_with(|| queue_ms(*left).total_cmp(&queue_ms(*right)))
             .then_with(|| {
                 candidates[*left]
                     .worker_key
                     .cmp(&candidates[*right].worker_key)
             })
-    })?;
-    Some(ShadowSelection { best, balanced })
+    })
 }
 
 fn unix_now_ms() -> u64 {

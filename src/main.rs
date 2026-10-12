@@ -122,11 +122,11 @@ struct CliArgs {
     #[arg(long)]
     agent_router_cluster_secret: Option<SecretString>,
 
-    /// Absolute projected-load threshold in milliseconds for agent-aware routing
+    /// Deprecated: accepted and validated, no longer used by agent-aware selection
     #[arg(long, default_value_t = 250.0)]
     agent_balance_abs_threshold_ms: f64,
 
-    /// Relative projected-load threshold for agent-aware routing
+    /// Deprecated: accepted and validated, no longer used by agent-aware selection
     #[arg(long, default_value_t = 1.2)]
     agent_balance_rel_threshold: f64,
 

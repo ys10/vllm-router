@@ -146,7 +146,7 @@ impl StateProvider for CountingStateProvider {
 }
 
 #[test]
-fn agent_policy_selects_fastest_worker_inside_balanced_subset_and_releases() {
+fn agent_policy_keeps_a_session_on_its_kv_holder_and_releases() {
     let secret = b"cluster-secret";
     let clock = Arc::new(ManualClock::new(1_000, 0));
     let provider = Arc::new(MockStateProvider::new(clock.clone()));
@@ -271,7 +271,16 @@ fn agent_policy_selects_fastest_worker_inside_balanced_subset_and_releases() {
     );
     assert_eq!(policy.reservations().active_reservations(), 1);
 
-    let metrics_context = context.clone();
+    // Load accounting is checked with a request that has no KV anywhere: a session
+    // with cached KV stays with its holder and does not move on load alone.
+    let metrics_context = RoutingContext::new(
+        "/v1/chat/completions",
+        Some("model-a".to_string()),
+        None,
+        true,
+    )
+    .with_prompt_tokens(80)
+    .with_decode_tokens(0);
     let mut lifecycle = RequestLifecycle::start(
         policy.clone() as Arc<dyn LoadBalancingPolicy>,
         workers[0].clone(),
@@ -744,7 +753,7 @@ fn route(policy: &AgentAwarePolicy, context: &Arc<RoutingContext>) -> usize {
 }
 
 #[test]
-fn valid_hint_overrides_score_inside_balanced_subset_and_acks_once() {
+fn valid_hint_target_holding_migrated_kv_is_applied_and_acks_once() {
     let full = RolloutPercent::new(100).unwrap();
     let context = session_context(full, true);
     let hinted = 1 - unhinted_choice(full, &context);
@@ -857,4 +866,96 @@ fn prefill_role_policy_scores_prefill_workers_and_applies_hints() {
     let unified = hint_policy(snapshot, full, true);
     route(&unified.policy, &context);
     assert_eq!(unified.policy.route_hint_stats().target_unavailable, 1);
+}
+
+fn placement_on(
+    server: ServerIdentity,
+    context: &RoutingContext,
+    cached_tokens: u64,
+) -> FreshValue<SessionPlacementState> {
+    FreshValue {
+        value: SessionPlacementState {
+            schema_version: 1,
+            message_type: MessageType::SessionPlacement,
+            seq: 2,
+            observed_at_ms: 1_000,
+            expires_at_ms: 61_000,
+            server,
+            payload: SessionPlacementPayload {
+                session_key: context.session_key(HINT_SECRET).unwrap(),
+                session_epoch: 1,
+                prefix_digest: "d".repeat(64),
+                cached_prefix_tokens: cached_tokens,
+                block_size_tokens: 16,
+                hbm_blocks: cached_tokens / 16,
+                dram_blocks: 0,
+                hbm_cached_tokens: cached_tokens,
+                dram_cached_tokens: 0,
+            },
+        },
+        ingested_at_monotonic_ms: 0,
+        fresh_until_monotonic_ms: 15_000,
+    }
+}
+
+fn kv_session_context() -> Arc<RoutingContext> {
+    let full = RolloutPercent::new(100).unwrap();
+    loop {
+        let context = Arc::new(
+            RoutingContext::new(
+                "/v1/chat/completions",
+                Some("model-a".to_string()),
+                None,
+                false,
+            )
+            .with_prompt_tokens(800)
+            .with_decode_tokens(0)
+            .with_session(SessionContext {
+                tenant_id: "tenant-a".to_string(),
+                session_id: "session-kv".to_string(),
+                session_epoch: Some(1),
+                expected_parent_prefix_digest: Some("d".repeat(64)),
+                model_revision: Some("revision-a".to_string()),
+                tokenizer_revision: Some("tokenizer-a".to_string()),
+            }),
+        );
+        if full.includes(context.routing_id()) {
+            return context;
+        }
+    }
+}
+
+#[test]
+fn session_with_cached_kv_stays_on_its_holder_when_another_worker_is_idle() {
+    // Worker A holds 768 of 800 prompt tokens but has 2 s of queued prefill;
+    // worker B is idle. Moving would recompute the whole prefix, so a session
+    // only leaves its holder once AgentRoute has migrated its KV.
+    let full = RolloutPercent::new(100).unwrap();
+    let context = kv_session_context();
+    let mut snapshot = snapshot_with_loads(2_000, 0);
+    let (key_a, server_a) = snapshot
+        .workers
+        .iter()
+        .find(|(_, worker)| worker.identity.as_ref().unwrap().server_id == "server-a")
+        .map(|(key, worker)| (key.clone(), worker.identity.clone().unwrap()))
+        .unwrap();
+    snapshot.session_placements.insert(
+        format!("{}:{key_a}", context.session_key(HINT_SECRET).unwrap()),
+        placement_on(server_a, &context, 768),
+    );
+    let harness = hint_policy(snapshot, full, true);
+
+    assert_eq!(route(&harness.policy, &context), 0);
+}
+
+#[test]
+fn request_without_kv_goes_to_the_least_loaded_worker_without_thresholds() {
+    let full = RolloutPercent::new(100).unwrap();
+    let context = kv_session_context();
+    // 100 ms of queued work on A is inside the old 250 ms "balanced" band, which
+    // used to make A and B equivalent; the projected load alone decides now.
+    let toward_b = hint_policy(snapshot_with_loads(100, 0), full, true);
+    assert_eq!(route(&toward_b.policy, &context), 1);
+    let toward_a = hint_policy(snapshot_with_loads(0, 100), full, true);
+    assert_eq!(route(&toward_a.policy, &context), 0);
 }

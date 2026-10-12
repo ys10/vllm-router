@@ -129,28 +129,38 @@ that timestamp and therefore does not depend on wall-clock synchronization.
 Bootstrap validates `observed_at_ms` with at most 2 seconds of clock skew.
 Expired state is never used for cache-affinity scoring.
 
-## Load-balance threshold semantics
+## Selection: earliest estimated completion among KV holders
 
-Projected load is measured in milliseconds. Given the minimum candidate load
-`m` and another candidate load `x`, that candidate is imbalanced only when both
-strict inequalities hold:
+Earlier versions first kept a "balanced subset" of candidates within
+`max(m + 250 ms, m * 1.2)` of the minimum projected load `m` and then preferred
+cache reuse inside it. Those fixed bands ignored that leaving the KV holder
+recomputes the whole prefix: on a saturated 4P1D deployment 1.8% of later-round
+requests left their holder, raising prefill work by about 6% and slowing every
+queue. The bands are gone; `--agent-balance-abs-threshold-ms` and
+`--agent-balance-rel-threshold` are still validated but no longer affect
+selection.
 
-```text
-(x - m > absolute_threshold_ms)
-AND
-(x > m * relative_threshold)
-```
-
-The v1 defaults are 250 ms and 1.2. Equality is balanced. The unique maximal
-balanced subset containing the global minimum therefore includes every
-candidate satisfying:
+For each candidate the policy estimates
 
 ```text
-x <= max(m + absolute_threshold_ms, m * relative_threshold)
+completion_ms = projected_load_ms + local_reservations_ms + own_work_ms
 ```
 
-The `AND` operator intentionally matches upstream cache-aware behavior. A
-future `OR` interpretation requires a new policy contract version.
+where `own_work_ms` is the scorer's service estimate for this request on that
+candidate (cached tokens save their prefill time). Every term is a measured or
+reported quantity; there are no tuned constants.
+
+* If any candidate holds the session's KV — a compatible session placement, or
+  the source or target of a valid Route Hint when hints are enabled — the policy
+  chooses only among those holders. The Router never recomputes a prefix just to
+  rebalance load; moving a session is AgentRoute's job, after migrating its KV.
+  A hint source or target without its own placement report is charged the
+  holder's reused work, because a READY target received the same KV.
+* Otherwise (no cached KV anywhere, e.g. the first request of a session), it
+  chooses among all candidates, which is the least-loaded one.
+
+Ties prefer the hint target, then the lower projected queue, then the worker
+key.
 
 ## Shadow decisions and rollout
 
@@ -195,10 +205,10 @@ redis_load_ms = 1000 * (waiting_prefill_tokens
 Fresh vLLM metrics may observe running or waiting requests before their Redis
 details arrive. Only the positive count difference is added, using the
 configured fallback request cost, so Redis and metrics do not double-count the
-same request. The balanced-subset input adds this lag estimate and all local
+same request. The projected queue adds this lag estimate and all local
 reservations to `redis_load_ms`.
 
-Within the balanced subset, the default scorer estimates request service time.
+The default scorer estimates this request's own service time (`own_work_ms`).
 HBM tokens save their prefill recomputation time. DRAM tokens are reused only
 when their recomputation time exceeds the configured block-restore cost; the
 net difference is the DRAM saving. Exact session key, epoch, model revision,
@@ -301,7 +311,8 @@ shadow choice only if all hold:
 1. agent-aware state is complete for the candidate set;
 2. exactly one candidate has a fresh load whose identity has
    `server_id == preferred_server`;
-3. that candidate belongs to the maximal balanced subset;
+3. that candidate has the earliest estimated completion among the session's KV
+   holders (the hint source and target are holders; see Selection);
 4. the request is in the enforced rollout cohort.
 
 Otherwise the normal decision is used and the hint outcome is recorded as one

@@ -56,9 +56,10 @@ vllm-router --policy agent_aware \
 ```
 
 The Python `PolicyType.AgentAware` uses the same environment variables.
-`--agent-balance-abs-threshold-ms`, `--agent-balance-rel-threshold`, and
-`--agent-dram-block-restore-ms` override the main scoring parameters on the
-Rust CLI. Production defaults to shadow-only. Set
+`--agent-dram-block-restore-ms` overrides the DRAM restore cost on the Rust
+CLI. `--agent-balance-abs-threshold-ms` and `--agent-balance-rel-threshold` are
+accepted for compatibility but no longer affect selection (see
+`spec/protocol-v1.md`, "Selection"). Production defaults to shadow-only. Set
 `--agent-rollout-percent 0|1|5|25|100` or `AGENT_ROUTER_ROLLOUT_PERCENT` for
 Python, and promote in that order after checking
 `vllm_router_agent_rollout_decisions_total`. Agent-aware routing is
