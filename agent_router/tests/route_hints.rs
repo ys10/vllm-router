@@ -438,20 +438,36 @@ fn acker_acknowledges_a_restarted_producer_reusing_plan_and_version() {
     let (_, store) = store();
     let (acker, mut receiver) = RouteHintAcker::new(CLUSTER, "router-a", 4);
     store.apply_route_hint_batch(
-        &[document_from("apc-old", 3, NOW_UNIX_MS, vec![hint(1, "vllm-p1", "ready", 10_000, 3)])],
+        &[document_from(
+            "apc-old",
+            3,
+            NOW_UNIX_MS,
+            vec![hint(1, "vllm-p1", "ready", 10_000, 3)],
+        )],
         CLUSTER,
     );
     let old = store.snapshot().route_hints.hints[&session(1)].clone();
     assert!(acker.acknowledge(&old, 1));
 
     store.apply_route_hint_batch(
-        &[document_from("apc-new", 3, NOW_UNIX_MS + 1, vec![hint(1, "vllm-p1", "ready", 10_000, 3)])],
+        &[document_from(
+            "apc-new",
+            3,
+            NOW_UNIX_MS + 1,
+            vec![hint(1, "vllm-p1", "ready", 10_000, 3)],
+        )],
         CLUSTER,
     );
     let new = store.snapshot().route_hints.hints[&session(1)].clone();
 
-    assert_eq!((new.plan_id.as_str(), new.state_version), (old.plan_id.as_str(), old.state_version));
-    assert!(acker.acknowledge(&new, 2), "same plan and version from a new producer is a new hint");
+    assert_eq!(
+        (new.plan_id.as_str(), new.state_version),
+        (old.plan_id.as_str(), old.state_version)
+    );
+    assert!(
+        acker.acknowledge(&new, 2),
+        "same plan and version from a new producer is a new hint"
+    );
     assert_eq!(receiver.try_recv().unwrap().observed_at_ms, 1);
     assert_eq!(receiver.try_recv().unwrap().observed_at_ms, 2);
 }

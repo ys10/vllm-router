@@ -143,6 +143,9 @@ pub struct ServerLoadPayload {
     pub decode_tokens_per_second_ewma: f64,
     pub kv_cache_usage_ratio: f64,
     pub requests: Vec<RequestLoad>,
+    /// Measured rate of loading KV from the local SSD tier (LMCache), if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssd_load_tokens_per_second_ewma: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -169,6 +172,22 @@ pub struct SessionPlacementPayload {
     pub dram_blocks: u64,
     pub hbm_cached_tokens: u64,
     pub dram_cached_tokens: u64,
+    /// Length of the prefix identified by `prefix_digest`. Absent means the
+    /// cached tokens are the whole prefix (`cached_prefix_tokens`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_tokens: Option<u64>,
+    /// Blocks and tokens of the prefix held only on the local SSD tier, beyond
+    /// those in HBM and DRAM.
+    #[serde(default)]
+    pub ssd_blocks: u64,
+    #[serde(default)]
+    pub ssd_cached_tokens: u64,
+}
+
+impl SessionPlacementPayload {
+    pub fn prefix_tokens(&self) -> u64 {
+        self.prefix_tokens.unwrap_or(self.cached_prefix_tokens)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -365,6 +384,14 @@ fn validate_load(payload: &ServerLoadPayload) -> Result<(), StateError> {
             "throughput EWMAs must be finite and positive".into(),
         ));
     }
+    if payload
+        .ssd_load_tokens_per_second_ewma
+        .is_some_and(|rate| !rate.is_finite() || rate <= 0.0)
+    {
+        return Err(StateError::Invalid(
+            "SSD load rate must be finite and positive when present".into(),
+        ));
+    }
     if !payload.kv_cache_usage_ratio.is_finite()
         || !(0.0..=1.0).contains(&payload.kv_cache_usage_ratio)
     {
@@ -389,10 +416,16 @@ fn validate_placement(payload: &SessionPlacementPayload) -> Result<(), StateErro
     if payload
         .hbm_cached_tokens
         .saturating_add(payload.dram_cached_tokens)
+        .saturating_add(payload.ssd_cached_tokens)
         != payload.cached_prefix_tokens
     {
         return Err(StateError::Invalid(
-            "HBM and DRAM cached token counts must sum to cached_prefix_tokens".into(),
+            "HBM, DRAM and SSD cached token counts must sum to cached_prefix_tokens".into(),
+        ));
+    }
+    if payload.cached_prefix_tokens > payload.prefix_tokens() {
+        return Err(StateError::Invalid(
+            "cached_prefix_tokens cannot exceed prefix_tokens".into(),
         ));
     }
     if payload.hbm_cached_tokens > payload.hbm_blocks.saturating_mul(payload.block_size_tokens)
@@ -400,6 +433,7 @@ fn validate_placement(payload: &SessionPlacementPayload) -> Result<(), StateErro
             > payload
                 .dram_blocks
                 .saturating_mul(payload.block_size_tokens)
+        || payload.ssd_cached_tokens > payload.ssd_blocks.saturating_mul(payload.block_size_tokens)
     {
         return Err(StateError::Invalid(
             "cached tokens exceed tier block capacity".into(),

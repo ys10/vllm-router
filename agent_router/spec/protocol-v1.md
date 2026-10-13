@@ -77,11 +77,26 @@ entry with the same value. A conflicting canonical entry or a non-object
 `vllm_xargs` value is a client error. This prevents Router scoring identity and
 vLLM publication identity from diverging.
 
-HBM and DRAM block counts are disjoint residency counts for that exact prefix.
-They must not double-count a block. `hbm_cached_tokens` and
-`dram_cached_tokens` identify the reusable token count in each tier, including
-any partial block. Their sum must equal `cached_prefix_tokens`, and each tier's
-token count cannot exceed its block capacity.
+HBM, DRAM and SSD block counts are disjoint residency counts for the prefix
+identified by `prefix_digest`. They must not double-count a block.
+`hbm_cached_tokens`, `dram_cached_tokens` and `ssd_cached_tokens` identify the
+reusable token count in each tier, including any partial block; tiers are
+consumed in that order from the start of the prefix. Their sum must equal
+`cached_prefix_tokens`, and each tier's token count cannot exceed its block
+capacity.
+
+`prefix_tokens` (optional) is the length of the prefix the digest identifies.
+When absent it equals `cached_prefix_tokens`. A producer publishes the digest
+of the session's full registered prefix and lets the tier counts shrink as HBM
+blocks are evicted, so a partially evicted session keeps matching its expected
+parent prefix digest. `ssd_blocks` / `ssd_cached_tokens` (optional, default 0)
+describe a local SSD tier such as LMCache on the same worker.
+
+A load document may carry `ssd_load_tokens_per_second_ewma`, the measured rate
+of loading KV from that SSD tier. The scorer credits SSD tokens with the
+recompute time they save net of loading them at that rate; without a measured
+rate they are not credited but still make the worker a holder of the
+session's KV (see Selection).
 
 Every load entry must report a non-negative `decode_tokens_remaining`. An
 unknown decode budget is invalid protocol data and must not be encoded as zero.
@@ -150,7 +165,8 @@ where `own_work_ms` is the scorer's service estimate for this request on that
 candidate (cached tokens save their prefill time). Every term is a measured or
 reported quantity; there are no tuned constants.
 
-* If any candidate holds the session's KV — a compatible session placement, or
+* If any candidate holds the session's KV in any tier (HBM, DRAM or SSD) — a
+  compatible session placement, or
   the source or target of a valid Route Hint when hints are enabled — the policy
   chooses only among those holders. The Router never recomputes a prefix just to
   rebalance load; moving a session is AgentRoute's job, after migrating its KV.

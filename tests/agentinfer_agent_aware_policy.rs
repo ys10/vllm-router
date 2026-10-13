@@ -45,6 +45,7 @@ fn load(server: ServerIdentity, waiting_prefill_tokens: u64) -> ServerLoadState 
             decode_tokens_per_second_ewma: 100.0,
             kv_cache_usage_ratio: 0.1,
             requests: Vec::new(),
+            ssd_load_tokens_per_second_ewma: None,
         },
     }
 }
@@ -195,6 +196,9 @@ fn agent_policy_keeps_a_session_on_its_kv_holder_and_releases() {
             dram_blocks: 0,
             hbm_cached_tokens: 80,
             dram_cached_tokens: 0,
+            prefix_tokens: None,
+            ssd_blocks: 0,
+            ssd_cached_tokens: 0,
         },
     };
     provider.publish(ClusterSnapshot {
@@ -891,6 +895,9 @@ fn placement_on(
                 dram_blocks: 0,
                 hbm_cached_tokens: cached_tokens,
                 dram_cached_tokens: 0,
+                prefix_tokens: None,
+                ssd_blocks: 0,
+                ssd_cached_tokens: 0,
             },
         },
         ingested_at_monotonic_ms: 0,
@@ -958,4 +965,32 @@ fn request_without_kv_goes_to_the_least_loaded_worker_without_thresholds() {
     assert_eq!(route(&toward_b.policy, &context), 1);
     let toward_a = hint_policy(snapshot_with_loads(0, 100), full, true);
     assert_eq!(route(&toward_a.policy, &context), 0);
+}
+
+#[test]
+fn session_whose_kv_is_only_on_ssd_stays_on_that_worker() {
+    // Worker A's HBM no longer holds the session, but its local SSD tier does;
+    // another worker would recompute the whole prefix.
+    let full = RolloutPercent::new(100).unwrap();
+    let context = kv_session_context();
+    let mut snapshot = snapshot_with_loads(2_000, 0);
+    let (key_a, server_a) = snapshot
+        .workers
+        .iter()
+        .find(|(_, worker)| worker.identity.as_ref().unwrap().server_id == "server-a")
+        .map(|(key, worker)| (key.clone(), worker.identity.clone().unwrap()))
+        .unwrap();
+    let mut placement = placement_on(server_a, &context, 768);
+    placement.value.payload.hbm_blocks = 0;
+    placement.value.payload.hbm_cached_tokens = 0;
+    placement.value.payload.ssd_blocks = 48;
+    placement.value.payload.ssd_cached_tokens = 768;
+    placement.value.payload.prefix_tokens = Some(800);
+    snapshot.session_placements.insert(
+        format!("{}:{key_a}", context.session_key(HINT_SECRET).unwrap()),
+        placement,
+    );
+    let harness = hint_policy(snapshot, full, true);
+
+    assert_eq!(route(&harness.policy, &context), 0);
 }

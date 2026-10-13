@@ -316,3 +316,83 @@ fn concurrent_reservations_observe_prior_writes_and_stay_balanced() {
     }
     assert_eq!(ledger.active_reservations(), 0);
 }
+
+fn ssd_placement(prefix_tokens: u64, ssd_cached_tokens: u64) -> SessionPlacementState {
+    let mut placement = placement_state();
+    placement.payload.dram_blocks = 0;
+    placement.payload.dram_cached_tokens = 0;
+    placement.payload.prefix_tokens = Some(prefix_tokens);
+    placement.payload.ssd_blocks = ssd_cached_tokens.div_ceil(16);
+    placement.payload.ssd_cached_tokens = ssd_cached_tokens;
+    placement.payload.cached_prefix_tokens = 32 + ssd_cached_tokens;
+    placement
+}
+
+fn ssd_context(secret: &[u8], placement: &mut SessionPlacementState) -> RoutingContext {
+    let context = RoutingContext::new(
+        "/v1/chat/completions",
+        Some("model-a".to_string()),
+        None,
+        false,
+    )
+    .with_prompt_tokens(80)
+    .with_decode_tokens(0)
+    .with_session(SessionContext {
+        tenant_id: "tenant-a".to_string(),
+        session_id: "session-a".to_string(),
+        session_epoch: Some(2),
+        expected_parent_prefix_digest: Some("c".repeat(64)),
+        model_revision: Some("revision-a".to_string()),
+        tokenizer_revision: Some("tokenizer-a".to_string()),
+    });
+    placement.payload.session_key = context.session_key(secret).unwrap();
+    context
+}
+
+#[test]
+fn ssd_tier_saves_recompute_only_at_a_measured_load_rate() {
+    let secret = b"cluster-secret";
+    let mut placement = ssd_placement(80, 32);
+    let context = ssd_context(secret, &mut placement);
+    let scorer = HbmDramScorer::new(secret, HbmDramScorerConfig::default()).unwrap();
+
+    // Without a measured SSD rate the tokens are held (affinity) but not credited.
+    let unknown = scorer
+        .score(&context, &load_state(), Some(&placement))
+        .unwrap();
+    assert_eq!(unknown.ssd_cached_tokens, 32);
+    assert!(unknown.holds_kv());
+    assert_eq!(unknown.ssd_net_saved_ms, 0.0);
+
+    // At 4000 tok/s 32 tokens load in 8 ms instead of a 32 ms recompute.
+    let mut load = load_state();
+    load.payload.ssd_load_tokens_per_second_ewma = Some(4_000.0);
+    let measured = scorer.score(&context, &load, Some(&placement)).unwrap();
+    assert_eq!(measured.ssd_net_saved_ms, 24.0);
+    assert_eq!(
+        measured.estimated_service_ms,
+        unknown.estimated_service_ms - 24.0
+    );
+}
+
+#[test]
+fn ssd_tier_placements_are_validated_against_the_identified_prefix() {
+    use agent_router::StateMessage;
+
+    let valid = StateMessage::SessionPlacement(ssd_placement(80, 32));
+    valid.validate().unwrap();
+
+    // Cached tokens beyond the prefix the digest identifies are invalid.
+    let too_long = StateMessage::SessionPlacement(ssd_placement(40, 32));
+    assert!(too_long.validate().is_err());
+
+    let mut miscounted = ssd_placement(80, 32);
+    miscounted.payload.cached_prefix_tokens = 32;
+    assert!(StateMessage::SessionPlacement(miscounted)
+        .validate()
+        .is_err());
+
+    let mut load = load_state();
+    load.payload.ssd_load_tokens_per_second_ewma = Some(-1.0);
+    assert!(StateMessage::ServerLoad(load).validate().is_err());
+}

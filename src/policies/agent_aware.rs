@@ -871,9 +871,7 @@ fn kv_holders(
     let mut holders: Vec<usize> = candidates
         .iter()
         .enumerate()
-        .filter(|(_, candidate)| {
-            candidate.score.hbm_reused_tokens > 0 || candidate.score.dram_reused_tokens > 0
-        })
+        .filter(|(_, candidate)| candidate.score.holds_kv())
         .map(|(index, _)| index)
         .collect();
     let reused_work_ms = holders

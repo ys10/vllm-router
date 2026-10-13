@@ -122,6 +122,18 @@ pub struct RequestScore {
     pub hbm_saved_ms: f64,
     pub dram_net_saved_ms: f64,
     pub dram_restore_ms: f64,
+    /// Prefix tokens held on the local SSD tier beyond HBM and DRAM.
+    pub ssd_cached_tokens: u64,
+    /// Recompute time saved by loading them at the measured SSD rate (0 when
+    /// the rate is unknown or loading is not faster).
+    pub ssd_net_saved_ms: f64,
+}
+
+impl RequestScore {
+    /// Whether the candidate holds any of the session's KV in any tier.
+    pub fn holds_kv(&self) -> bool {
+        self.hbm_reused_tokens > 0 || self.dram_reused_tokens > 0 || self.ssd_cached_tokens > 0
+    }
 }
 
 pub trait RequestScorer: Send + Sync + std::fmt::Debug {
@@ -211,7 +223,7 @@ impl RequestScorer for HbmDramScorer {
             .unwrap_or(self.config.default_prefill_tokens)
             .max(
                 placement
-                    .map(|placement| placement.payload.cached_prefix_tokens)
+                    .map(|placement| placement.payload.prefix_tokens())
                     .unwrap_or_default(),
             );
         let decode_tokens = context
@@ -241,11 +253,21 @@ impl RequestScorer for HbmDramScorer {
                 score.dram_restore_ms = restore_ms;
                 score.dram_net_saved_ms = recompute_ms - restore_ms;
             }
+
+            let remaining = remaining.saturating_sub(score.dram_reused_tokens);
+            score.ssd_cached_tokens = placement.payload.ssd_cached_tokens.min(remaining);
+            if let Some(rate) = load.payload.ssd_load_tokens_per_second_ewma {
+                let saved = milliseconds(score.ssd_cached_tokens, prefill_rate)?
+                    - milliseconds(score.ssd_cached_tokens, rate)?;
+                score.ssd_net_saved_ms = saved.max(0.0);
+            }
         }
 
-        score.estimated_service_ms =
-            (base_prefill_ms + decode_ms - score.hbm_saved_ms - score.dram_net_saved_ms)
-                .max(self.config.minimum_reservation_ms);
+        score.estimated_service_ms = (base_prefill_ms + decode_ms
+            - score.hbm_saved_ms
+            - score.dram_net_saved_ms
+            - score.ssd_net_saved_ms)
+            .max(self.config.minimum_reservation_ms);
         Ok(score)
     }
 }
