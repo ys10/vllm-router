@@ -216,7 +216,9 @@ fn agent_policy_keeps_a_session_on_its_kv_holder_and_releases() {
                                 "550e8400-e29b-41d4-a716-446655440000",
                                 "http://worker-a:8000",
                             ),
-                            100,
+                            // 50 ms queued: less than the 80 ms another worker
+                            // would spend recomputing the cached 80 tokens.
+                            50,
                         ),
                         ingested_at_monotonic_ms: 0,
                         fresh_until_monotonic_ms: 3_000,
@@ -275,8 +277,7 @@ fn agent_policy_keeps_a_session_on_its_kv_holder_and_releases() {
     );
     assert_eq!(policy.reservations().active_reservations(), 1);
 
-    // Load accounting is checked with a request that has no KV anywhere: a session
-    // with cached KV stays with its holder and does not move on load alone.
+    // Load accounting is checked with a request that has no KV anywhere.
     let metrics_context = RoutingContext::new(
         "/v1/chat/completions",
         Some("model-a".to_string()),
@@ -932,14 +933,7 @@ fn kv_session_context() -> Arc<RoutingContext> {
     }
 }
 
-#[test]
-fn session_with_cached_kv_stays_on_its_holder_when_another_worker_is_idle() {
-    // Worker A holds 768 of 800 prompt tokens but has 2 s of queued prefill;
-    // worker B is idle. Moving would recompute the whole prefix, so a session
-    // only leaves its holder once AgentRoute has migrated its KV.
-    let full = RolloutPercent::new(100).unwrap();
-    let context = kv_session_context();
-    let mut snapshot = snapshot_with_loads(2_000, 0);
+fn cached_kv_session(snapshot: &mut ClusterSnapshot, context: &RoutingContext) -> String {
     let (key_a, server_a) = snapshot
         .workers
         .iter()
@@ -948,11 +942,27 @@ fn session_with_cached_kv_stays_on_its_holder_when_another_worker_is_idle() {
         .unwrap();
     snapshot.session_placements.insert(
         format!("{}:{key_a}", context.session_key(HINT_SECRET).unwrap()),
-        placement_on(server_a, &context, 768),
+        placement_on(server_a, context, 768),
     );
-    let harness = hint_policy(snapshot, full, true);
+    key_a
+}
 
-    assert_eq!(route(&harness.policy, &context), 0);
+#[test]
+fn a_kv_holder_wins_unless_another_queue_is_shorter_by_more_than_the_recompute() {
+    // Worker A holds 768 of 800 prompt tokens; at 1000 tok/s, moving to idle
+    // worker B costs 768 ms of extra prefill.
+    let full = RolloutPercent::new(100).unwrap();
+    let context = kv_session_context();
+
+    // A: 500 ms queued + 32 ms own work beats B's 800 ms.
+    let mut short = snapshot_with_loads(500, 0);
+    cached_kv_session(&mut short, &context);
+    assert_eq!(route(&hint_policy(short, full, true).policy, &context), 0);
+
+    // A: 2000 ms queued + 32 ms; B finishes first even recomputing.
+    let mut long = snapshot_with_loads(2_000, 0);
+    cached_kv_session(&mut long, &context);
+    assert_eq!(route(&hint_policy(long, full, true).policy, &context), 1);
 }
 
 #[test]
@@ -968,29 +978,43 @@ fn request_without_kv_goes_to_the_least_loaded_worker_without_thresholds() {
 }
 
 #[test]
-fn session_whose_kv_is_only_on_ssd_stays_on_that_worker() {
-    // Worker A's HBM no longer holds the session, but its local SSD tier does;
-    // another worker would recompute the whole prefix.
+fn ssd_held_kv_counts_as_its_restore_time_at_the_measured_rate() {
+    // Worker A's HBM no longer holds the session but its local SSD tier holds
+    // 768 tokens, restored at a measured 10k tok/s (77 ms) instead of 768 ms
+    // of recompute.
     let full = RolloutPercent::new(100).unwrap();
     let context = kv_session_context();
-    let mut snapshot = snapshot_with_loads(2_000, 0);
-    let (key_a, server_a) = snapshot
-        .workers
-        .iter()
-        .find(|(_, worker)| worker.identity.as_ref().unwrap().server_id == "server-a")
-        .map(|(key, worker)| (key.clone(), worker.identity.clone().unwrap()))
-        .unwrap();
-    let mut placement = placement_on(server_a, &context, 768);
-    placement.value.payload.hbm_blocks = 0;
-    placement.value.payload.hbm_cached_tokens = 0;
-    placement.value.payload.ssd_blocks = 48;
-    placement.value.payload.ssd_cached_tokens = 768;
-    placement.value.payload.prefix_tokens = Some(800);
-    snapshot.session_placements.insert(
-        format!("{}:{key_a}", context.session_key(HINT_SECRET).unwrap()),
-        placement,
-    );
-    let harness = hint_policy(snapshot, full, true);
+    let route_with_queue = |queued_tokens: u64| {
+        let mut snapshot = snapshot_with_loads(queued_tokens, 0);
+        let (key_a, server_a) = snapshot
+            .workers
+            .iter()
+            .find(|(_, worker)| worker.identity.as_ref().unwrap().server_id == "server-a")
+            .map(|(key, worker)| (key.clone(), worker.identity.clone().unwrap()))
+            .unwrap();
+        let worker_a = snapshot.workers.get_mut(&key_a).unwrap();
+        worker_a
+            .load
+            .as_mut()
+            .unwrap()
+            .value
+            .payload
+            .ssd_load_tokens_per_second_ewma = Some(10_000.0);
+        let mut placement = placement_on(server_a, &context, 768);
+        placement.value.payload.hbm_blocks = 0;
+        placement.value.payload.hbm_cached_tokens = 0;
+        placement.value.payload.ssd_blocks = 48;
+        placement.value.payload.ssd_cached_tokens = 768;
+        placement.value.payload.prefix_tokens = Some(800);
+        snapshot.session_placements.insert(
+            format!("{}:{key_a}", context.session_key(HINT_SECRET).unwrap()),
+            placement,
+        );
+        route(&hint_policy(snapshot, full, true).policy, &context)
+    };
 
-    assert_eq!(route(&harness.policy, &context), 0);
+    // A: 500 ms queued + ~109 ms beats B's 800 ms recompute.
+    assert_eq!(route_with_queue(500), 0);
+    // A: 2000 ms queued; B is faster despite recomputing.
+    assert_eq!(route_with_queue(2_000), 1);
 }

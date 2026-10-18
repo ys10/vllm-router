@@ -165,15 +165,18 @@ where `own_work_ms` is the scorer's service estimate for this request on that
 candidate (cached tokens save their prefill time). Every term is a measured or
 reported quantity; there are no tuned constants.
 
-* If any candidate holds the session's KV in any tier (HBM, DRAM or SSD) — a
-  compatible session placement, or
-  the source or target of a valid Route Hint when hints are enabled — the policy
-  chooses only among those holders. The Router never recomputes a prefix just to
-  rebalance load; moving a session is AgentRoute's job, after migrating its KV.
-  A hint source or target without its own placement report is charged the
-  holder's reused work, because a READY target received the same KV.
-* Otherwise (no cached KV anywhere, e.g. the first request of a session), it
-  chooses among all candidates, which is the least-loaded one.
+The policy picks the candidate with the earliest `completion_ms` among all
+candidates. `own_work_ms` reflects the session prefix each candidate actually
+reports (HBM, DRAM, or local SSD restored at the measured rate), so a KV holder
+wins unless another candidate's queue is shorter by more than the recompute or
+restore the holder saves. A request without cached KV anywhere (e.g. the first
+of a session) goes to the least-loaded candidate.
+
+AgentRoute pulls load toward a node by migrating a session's KV there ahead of
+the session's next request. The target engine reports the migrated prefix as a
+session placement as it arrives, so the Router follows once the target is
+actually better. A Route Hint does not make its target a holder; it only
+breaks ties.
 
 Ties prefer the hint target, then the lower projected queue, then the worker
 key.

@@ -697,13 +697,10 @@ impl AgentAwarePolicy {
             _ => None,
         };
         let mut hint_outcome = None;
-        let kv = candidates.as_ref().map(|candidates| {
-            // Hints only name KV holders when this Router consumes hints at all.
-            let hinted_session = session_key
-                .as_deref()
-                .filter(|_| self.route_hint_acker.is_some());
-            kv_holders(candidates, &snapshot, now, hinted_session)
-        });
+        // A Route Hint does not make its target a holder: the target reports
+        // the migrated prefix itself as it arrives (placements), and the hint
+        // only breaks ties.
+        let kv = candidates.as_ref().map(|candidates| kv_holders(candidates));
         let hinted_index = hint_target
             .as_ref()
             .and_then(|target| target.as_ref().ok())
@@ -849,53 +846,27 @@ fn normalize_endpoint(endpoint: &str) -> &str {
 
 /// Which candidates already hold the session's KV, and each candidate's own work.
 struct KvHolders {
-    /// Candidate indices holding the session's KV: a compatible placement, or the
-    /// source/target of a valid Route Hint (a READY target received the KV by
-    /// migration; the source keeps it until copy-before-evict cleanup).
+    /// Candidate indices that reported a compatible placement for the session
+    /// (HBM, DRAM or local SSD), kept for observability.
+    #[allow(dead_code)]
     holders: Vec<usize>,
-    /// This request's service estimate per candidate. A hint source or target
-    /// without its own placement report is charged the holder's (reused) work.
+    /// This request's service estimate per candidate, from the prefix that
+    /// candidate actually holds.
     own_work_ms: Vec<f64>,
 }
 
-fn kv_holders(
-    candidates: &[ScoredCandidate],
-    snapshot: &ClusterSnapshot,
-    now: u64,
-    hinted_session: Option<&str>,
-) -> KvHolders {
-    let mut own_work_ms: Vec<f64> = candidates
-        .iter()
-        .map(|candidate| candidate.score.estimated_service_ms)
-        .collect();
-    let mut holders: Vec<usize> = candidates
-        .iter()
-        .enumerate()
-        .filter(|(_, candidate)| candidate.score.holds_kv())
-        .map(|(index, _)| index)
-        .collect();
-    let reused_work_ms = holders
-        .iter()
-        .map(|index| own_work_ms[*index])
-        .reduce(f64::min);
-    if let Some(hint) = hinted_session
-        .and_then(|session_key| snapshot.route_hints.hints.get(session_key))
-        .filter(|hint| hint.is_valid(now))
-    {
-        for (index, candidate) in candidates.iter().enumerate() {
-            let named = candidate.server_id == hint.preferred_server
-                || hint.source_server.as_deref() == Some(candidate.server_id.as_str());
-            if named && !holders.contains(&index) {
-                holders.push(index);
-                if let Some(reused) = reused_work_ms {
-                    own_work_ms[index] = own_work_ms[index].min(reused);
-                }
-            }
-        }
-    }
+fn kv_holders(candidates: &[ScoredCandidate]) -> KvHolders {
     KvHolders {
-        holders,
-        own_work_ms,
+        holders: candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| candidate.score.holds_kv())
+            .map(|(index, _)| index)
+            .collect(),
+        own_work_ms: candidates
+            .iter()
+            .map(|candidate| candidate.score.estimated_service_ms)
+            .collect(),
     }
 }
 
@@ -903,22 +874,20 @@ fn kv_holders(
 /// (reported load plus this Router's in-flight reservations) plus this request's
 /// own work there. There are no fixed balance bands; every term is measured.
 ///
-/// A session whose KV is cached somewhere only chooses among the KV holders, so
-/// the Router never recomputes a prefix just to rebalance load; moving a session
-/// is AgentRoute's job, after its KV has been migrated. Requests without cached
-/// KV choose among all candidates, i.e. the least-loaded one.
+/// Every candidate is considered. Own work reflects the session prefix that
+/// candidate actually holds (HBM, DRAM or local SSD, from its placement
+/// reports), so a holder wins unless another node's queue is shorter by more
+/// than the recompute it would cost. AgentRoute pulls load toward a node by
+/// migrating KV there ahead of time; the target reports the prefix as it
+/// arrives, and the request follows once the target is actually better. A
+/// Route Hint only breaks ties.
 fn select_shadow_candidate(
     candidates: &[ScoredCandidate],
     reservations: &ReservationView<'_>,
     kv: &KvHolders,
     hinted_index: Option<usize>,
 ) -> Option<usize> {
-    let all: Vec<usize> = (0..candidates.len()).collect();
-    let pool = if kv.holders.is_empty() {
-        &all
-    } else {
-        &kv.holders
-    };
+    let pool: Vec<usize> = (0..candidates.len()).collect();
     let queue_ms = |index: usize| {
         candidates[index].base_load_ms
             + reservations.reserved_ms(&candidates[index].reservation_key)
