@@ -847,8 +847,7 @@ fn normalize_endpoint(endpoint: &str) -> &str {
 /// Which candidates already hold the session's KV, and each candidate's own work.
 struct KvHolders {
     /// Candidate indices that reported a compatible placement for the session
-    /// (HBM, DRAM or local SSD), kept for observability.
-    #[allow(dead_code)]
+    /// (HBM, DRAM or local SSD), including migration targets as KV arrives.
     holders: Vec<usize>,
     /// This request's service estimate per candidate, from the prefix that
     /// candidate actually holds.
@@ -874,20 +873,26 @@ fn kv_holders(candidates: &[ScoredCandidate]) -> KvHolders {
 /// (reported load plus this Router's in-flight reservations) plus this request's
 /// own work there. There are no fixed balance bands; every term is measured.
 ///
-/// Every candidate is considered. Own work reflects the session prefix that
-/// candidate actually holds (HBM, DRAM or local SSD, from its placement
-/// reports), so a holder wins unless another node's queue is shorter by more
-/// than the recompute it would cost. AgentRoute pulls load toward a node by
-/// migrating KV there ahead of time; the target reports the prefix as it
-/// arrives, and the request follows once the target is actually better. A
-/// Route Hint only breaks ties.
+/// A session whose prefix some candidates report holding (HBM, DRAM or local
+/// SSD, from their placement reports) chooses only among them; own work
+/// reflects how much each holds. The Router never drops a prefix to rebalance:
+/// that is AgentRoute's job, which migrates the KV ahead of the next request.
+/// The migration target reports the prefix as it arrives, so it joins the
+/// holders and wins once it is actually the earliest to finish. Requests whose
+/// prefix nobody holds go to the earliest-finishing (least-loaded) candidate.
+/// A Route Hint does not make its target a holder; it only breaks ties.
 fn select_shadow_candidate(
     candidates: &[ScoredCandidate],
     reservations: &ReservationView<'_>,
     kv: &KvHolders,
     hinted_index: Option<usize>,
 ) -> Option<usize> {
-    let pool: Vec<usize> = (0..candidates.len()).collect();
+    let all: Vec<usize> = (0..candidates.len()).collect();
+    let pool = if kv.holders.is_empty() {
+        &all
+    } else {
+        &kv.holders
+    };
     let queue_ms = |index: usize| {
         candidates[index].base_load_ms
             + reservations.reserved_ms(&candidates[index].reservation_key)
